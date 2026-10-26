@@ -1312,6 +1312,11 @@ class RepoAgnostic(QueueCase):
         custom = fx.root / "custom.plist"
         fx.mq(*base, "--launchd-plist", str(custom), "--launchd-label-prefix", "org.example.mq", check=True)
         self.assertEqual(plistlib.loads(custom.read_bytes())["Label"], f"org.example.mq.{fx.repo_id()}")
+        # --runtime-allow values must never leak into the label (they once shadowed the prefix variable).
+        both = fx.root / "both.plist"
+        fx.mq(*base, "--runtime-allow", "data/", "--runtime-allow", "cache/x.lock", "--launchd-plist", str(both),
+              check=True)
+        self.assertEqual(plistlib.loads(both.read_bytes())["Label"], f"local.merge-queue.{fx.repo_id()}")
         bad = fx.mq(*base, "--launchd-label-prefix", "bad prefix/x")
         self.assertEqual(bad.returncode, 2, bad.stderr)
 

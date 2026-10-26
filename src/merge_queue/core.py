@@ -2029,10 +2029,10 @@ def cmd_install(args):
     prefix = args.launchd_label_prefix
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", prefix):
         raise MqError(f"invalid --launchd-label-prefix {prefix!r}: use letters, digits, '.', '_' or '-'", 2)
-    for prefix in args.runtime_allow or []:
-        pure = PurePosixPath(prefix)
-        if pure.is_absolute() or ".." in pure.parts or pure.parts in ((), (".",)) or any(c in prefix for c in "*?["):
-            raise MqError(f"--runtime-allow {prefix!r} must be one specific relative runtime path "
+    for allowed in args.runtime_allow or []:  # not `prefix`: that name holds the launchd label prefix
+        pure = PurePosixPath(allowed)
+        if pure.is_absolute() or ".." in pure.parts or pure.parts in ((), (".",)) or any(c in allowed for c in "*?["):
+            raise MqError(f"--runtime-allow {allowed!r} must be one specific relative runtime path "
                           "(e.g. data/), never a glob, '.', or '..'", 2)
     state = Path(args.state_dir).resolve() if args.state_dir else default_state_dir(common)
     previous = read_config(common)

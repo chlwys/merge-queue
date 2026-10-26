@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "merge-queue"
-version = "0.1.0"
+version = "0.1.1"
 description = "Deterministic local merge queue for Git repositories, with a global MCP completion adapter"
 readme = "README.md"
 license = { text = "MIT" }
