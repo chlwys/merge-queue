@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "comment": "Example validation policy. Copy to <checkout>/.merge-queue/policy.json and adapt. Every tracked path must match a rule (`merge-queue policy check` verifies this); a changed path that matches no rule blocks the landing as an unknown scope.",
+  "rules": [
+    {"match": ["docs/*", "*.md", "LICENSE"], "checks": []},
+    {"match": ["src/*", "tests/*", "pyproject.toml"], "checks": ["unit"]},
+    {"match": ["web/*"], "checks": ["web"]},
+    {"match": [".gitignore", ".merge-queue/*", ".github/*", "examples/*"], "checks": ["syntax"]}
+  ],
+  "checks": {
+    "unit": {
+      "argv": ["python3", "-m", "unittest", "discover", "-s", "tests"],
+      "cwd": ".",
+      "env": {"PYTHONPATH": "src", "PYTHONDONTWRITEBYTECODE": "1"},
+      "timeout": 900
+    },
+    "syntax": {
+      "argv": ["python3", "-c", "import json, pathlib; [json.loads(p.read_text()) for p in pathlib.Path('.merge-queue').glob('*.json')]"],
+      "timeout": 60
+    },
+    "web": {
+      "plan": ["scripts/plan-web-checks", "--base", "{target}", "--candidate", "{candidate}"],
+      "bootstrap": {
+        "node": ["npm", "--prefix", "web", "ci"],
+        "python": ["python3", "-m", "pip", "install", "--quiet", "-r", "web/requirements.txt"]
+      },
+      "argv": ["npm", "--prefix", "web", "test"],
+      "cwd": ".",
+      "timeout": 1800
+    }
+  }
+}

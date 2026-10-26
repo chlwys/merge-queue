@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "merge-queue"
+version = "0.1.0"
+description = "Deterministic local merge queue for Git repositories, with a global MCP completion adapter"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+# The queue core (merge_queue.core) imports only the standard library; the MCP adapter needs these.
+dependencies = [
+    "fastmcp==4.1.3",
+    "mcp==2.3.0",
+    "watchfiles==1.3.0",
+]
+
+[project.scripts]
+merge-queue = "merge_queue.core:cli"
+merge-queue-mcp = "merge_queue.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/merge_queue"]
