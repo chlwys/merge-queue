@@ -547,14 +547,57 @@ def outcome_code(req: dict) -> int:
 
 
 def wait_terminal(ctx: Ctx, rid: str, timeout: float) -> dict:
+    """Read once, then wait for native receipt events. Interrupting stops only this observer.
+
+    watch registers before its first yield. Its first event or startup timeout is a registration
+    checkpoint, closing the initial read/register race. Later quiet yields never reread receipts.
+    """
     deadline = time.monotonic() + timeout
-    while True:
+
+    def snapshot():
         req = load_req(ctx, rid) or next((t for t in tombstones(ctx) if t["request_id"] == rid), None)
         if req is None:
             raise MqError(f"unknown request {rid}")
-        if req["state"] in TERMINAL or time.monotonic() >= deadline:
-            return req
-        time.sleep(0.3)
+        return req
+
+    req = snapshot()
+    if req["state"] in TERMINAL or time.monotonic() >= deadline:
+        return req
+    # Ordinary commands, immediate results and nonpositive waits remain standard-library only.
+    try:
+        from watchfiles import watch
+    except ImportError as exc:
+        raise MqError("receipt waiting requires watchfiles; install the merge-queue package dependencies; "
+                      f"reattach with `merge-queue result {rid} --wait`, do not resubmit") from exc
+
+    class Deadline:
+        # watch accepts any stop signal with is_set(). Only the clock is checked here, never queue state.
+        def is_set(self):
+            return time.monotonic() >= deadline
+
+    stop = Deadline()
+    paths = {str(ctx.p(name, f"{rid}.json")) for name in ("requests", "tombstones")}
+    dirs = [ctx.p(name) for name in ("requests", "tombstones")]
+    while not stop.is_set():
+        missing = {str(d) for d in dirs if not d.is_dir()}
+        roots = [d for d in dirs if d.is_dir()] + ([ctx.state] if missing else [])
+        first = True
+        with contextlib.closing(watch(
+                *roots, recursive=False, watch_filter=lambda change, path: path in paths or path in missing,
+                force_polling=False, ignore_permission_denied=False, debounce=50, step=10,
+                rust_timeout=1000, yield_on_timeout=True, stop_event=stop)) as events:
+            for changes in events:
+                if first or changes:
+                    first = False
+                    req = snapshot()
+                    if req["state"] in TERMINAL:
+                        return req
+                if missing and any(path in missing for _, path in changes):
+                    break  # Newly created tombstones directory: register it directly, then recheck.
+            else:
+                break
+    # Completion racing the timeout takes precedence over a pending result.
+    return snapshot()
 
 
 def brief(req: dict) -> dict:

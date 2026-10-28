@@ -29,11 +29,15 @@ MAX_TIMEOUT = 82800  # 23 hours, below the documented 24-hour client timeout.
 REPO_ID_RE = re.compile(r"[0-9a-f]{12}")
 REQUIRED_CONFIG = ("stateDir", "checkout", "tq", "entry", "policy")
 INSTRUCTIONS = (
-    "Submit or retry once with a durable request_id and explicit stable owner_id, then wait for this tool's "
-    "completion/background notification. Never loop on status. After interruption reconnect the same receipt "
-    "with wait_for_result; never resubmit implicitly. To follow a request you do not own, use watch_request; to "
-    "wait until a repository's queue has drained, use wait_for_queue_empty. list_queues is one-shot discovery, "
-    "never a polling loop.")
+    "Submit or retry once with a saved durable request_id and explicit stable owner_id. Keep one pending "
+    "wait/background call per observation; while pending do independent work, otherwise yield for the host's "
+    "completion notification. Never loop on status/result/list_queues, sleep, or repeated short wrapper waits "
+    "when the host can notify completion. A host yield/session handle is not a queue timeout: keep the same "
+    "call pending. Use a long supported timeout with transport margin. After an actual interruption or queue "
+    "timeout reconnect the same receipt with wait_for_result; never resubmit implicitly. To follow a request "
+    "you do not own, use watch_request; to wait until a repository's queue has drained, use "
+    "wait_for_queue_empty. list_queues is one-shot discovery, never a polling loop. The server cannot wake a "
+    "closed session. Without MCP, run one merge-queue result <request_id> --wait --timeout <seconds> invocation.")
 
 
 def valid_id(value: str, label: str) -> str:
@@ -396,8 +400,9 @@ def make_server(allow_repos: list[str] | None = None) -> FastMCP:
                      timeout_seconds: float = 7200) -> dict:
         """Submit committed HEAD once, then stay pending until terminal. owner_id is a stable chat/session or task ID.
 
-        Save request_id before calling. On timeout/disconnect use wait_for_result with the same
-        receipt; do not submit another request. Existing exact-commit deduplication is preserved.
+        Save request_id before calling. Keep this call pending; do independent work or yield for the host's
+        completion notification, without repeated short wrapper waits. On actual timeout/disconnect use
+        wait_for_result with the same receipt; do not submit another request. Existing exact-commit deduplication is preserved.
         """
         path, queue = await context(worktree, owner_id, request_id, timeout_seconds)
         sha, branch = await asyncio.to_thread(core.resolve_source,
@@ -443,7 +448,8 @@ def make_server(allow_repos: list[str] | None = None) -> FastMCP:
                               timeout_seconds: float = 7200) -> dict:
         """Reconnect one existing durable receipt and await its terminal outcome without resubmitting.
 
-        Use after an interrupted/timed-out call, not as a periodic status loop.
+        Use after an actually interrupted/timed-out call. Keep one call pending; do independent work or
+        yield for host completion notification. A host yield/session handle is not a queue timeout.
         """
         _, queue = await context(worktree, owner_id, request_id, timeout_seconds)
         return await await_result(queue, request_id, owner_id, timeout_seconds, ctx)
@@ -455,7 +461,8 @@ def make_server(allow_repos: list[str] | None = None) -> FastMCP:
         repository is an absolute path inside any worktree of the repo, or its repo_id. request_id is a
         canonical queue id or a requested id from submit/retry. Sends progress when the state changes and
         returns the request summary with terminal, timed_out and exit_code. Writes nothing and never
-        resubmits; an unknown id is an immediate error. On timeout call it again; do not poll.
+        resubmits; an unknown id is an immediate error. Keep one call pending and yield for host completion
+        notification; only an actual timeout/interruption needs reattachment to the same receipt.
         """
         valid_id(request_id, "request_id")
         checked_timeout(timeout_seconds)
@@ -468,7 +475,8 @@ def make_server(allow_repos: list[str] | None = None) -> FastMCP:
 
         repository is an absolute path inside any worktree of the repo, or its repo_id. Returns at once when
         already empty; otherwise waits for native file events and sends progress when the pending set
-        changes. Result: empty, repository, repo_id, observed_at, pending (request ids) and timed_out.
+        changes. Keep one call pending; do independent work or yield for host completion notification.
+        Result: empty, repository, repo_id, observed_at, pending (request ids) and timed_out.
         """
         checked_timeout(timeout_seconds)
         queue = await resolve_repository(repository, allowed)

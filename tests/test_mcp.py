@@ -92,7 +92,9 @@ class MCPIntegration(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("owner_id", tool.input_schema["properties"])
             instructions = client.instructions
             for phrase in ("watch_request", "wait_for_queue_empty", "list_queues", "never a polling loop",
-                           "never resubmit implicitly"):
+                           "never resubmit implicitly", "one pending", "independent work",
+                           "yield for the host", "short wrapper waits", "transport margin",
+                           "cannot wake a closed session", "not a queue timeout"):
                 self.assertIn(phrase, instructions)
             result = self.data(await client.call_tool("submit", self.args(wt, "mcp-success"),
                                                      progress_handler=self.on_progress))

@@ -45,8 +45,9 @@ merge-queue --help
 merge-queue-mcp --help
 ```
 
-The MCP dependencies (`fastmcp==4.1.3`, `mcp==2.3.0`, `watchfiles==1.3.0`) are installed with the package;
-the queue core itself uses only the Python standard library.
+The dependencies (`fastmcp==4.1.3`, `mcp==2.3.0`, `watchfiles==1.3.0`) are installed with the package.
+The core imports only the Python standard library for ordinary commands and immediate results; a pending
+CLI `--wait` lazily loads `watchfiles` for native filesystem notifications, with no polling fallback.
 
 ## Quickstart
 

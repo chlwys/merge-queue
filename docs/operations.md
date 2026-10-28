@@ -95,6 +95,12 @@ directory of `git`, `uv` or `npm`): a supervisor-run runner does not read your s
 
 Owner id: `--owner`, else `$MERGE_QUEUE_OWNER`, else `$CODEX_THREAD_ID`, else the worktree directory name.
 
+For agent waiting, prefer the MCP pending call described in [docs/mcp.md](mcp.md). Without MCP, run one
+`merge-queue result <id> --wait --timeout 7200` invocation. It waits on native receipt events, not periodic
+receipt reads. A command host yielding a session handle leaves that invocation pending; wait for host
+completion instead of issuing another command or repeated short wrapper waits. An actual timeout or
+interruption stops observation only: reattach the same receipt, never resubmit.
+
 ## Manual Git override
 
 A person may commit, merge, update refs and push directly. Set the override for one command or a shell

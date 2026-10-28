@@ -98,21 +98,46 @@ as a tool failure. No progress token means no progress notifications; the final 
 normally. A directory that does not exist yet (`tombstones/` appears with the first acknowledgement) is not
 created by read-only tools; the server watches the state directory for it instead.
 
+Save the durable request ID and stable owner ID before submitting once. Keep **one pending wait/background
+call per observation**. While it is pending, do independent work; when none remains, yield for the host's
+completion notification. Do not loop on `status`, `result`, `list_queues`, sleeps, or repeated short wrapper
+wait calls when the host provides completion notifications. A wrapper returning a session/task handle or
+yielding control means the same call is still pending; it is **not a queue timeout**. Use a long supported
+queue timeout with transport margin (for example 7200 seconds under a 86400-second client limit).
+
 Timeouts, cancellation, MCP disconnects and closing a chat stop the **observer**, not the durable queue job.
-A timed-out result is not a reason to resubmit: call `wait_for_result` (owner) or `watch_request` (anyone)
-again with the same ids. Do not wrap the queue in a polling loop or repeatedly call CLI `status`/`result`;
-`list_queues` is for discovery, not waiting. The server cannot wake a closed agent session; a later
-explicit reconnect reads the same receipt.
+Only an actual interrupted/timed-out call needs reattachment: use `wait_for_result` (owner) or
+`watch_request` (anyone) with the same saved ids. Never submit a duplicate to recover an uncertain outcome.
+Use `watch_request` for another owner's request and `wait_for_queue_empty` for repository drain;
+`list_queues` is one-shot discovery. The server cannot wake a closed agent session; a later explicit
+reconnect reads the same receipt. Native notifications and host completion delivery already provide the
+waiting path; the server does not inject chat messages or schedule a session to resume.
+
+Without MCP, use one blocking CLI invocation:
+
+```sh
+merge-queue result <request-id> --wait --timeout 7200
+```
+
+CLI receipt waits also observe native filesystem events, with one registration checkpoint and a final
+snapshot at timeout; quiet wake-ups do not reread receipts and there is no polling fallback. Interrupting
+the CLI stops observation only. If the command host yields a process/session handle, leave that same
+invocation pending and await host completion; the yield is not the CLI's `--timeout`.
 
 ## Server instructions
 
 Clients receive these instructions on initialization:
 
-> Submit or retry once with a durable request_id and explicit stable owner_id, then wait for this tool's
-> completion/background notification. Never loop on status. After interruption reconnect the same receipt with
-> wait_for_result; never resubmit implicitly. To follow a request you do not own, use watch_request; to wait
-> until a repository's queue has drained, use wait_for_queue_empty. list_queues is one-shot discovery, never a
-> polling loop.
+> Submit or retry once with a saved durable request_id and explicit stable owner_id. Keep one pending
+> wait/background call per observation; while pending do independent work, otherwise yield for the
+> host's completion notification. Never loop on status/result/list_queues, sleep, or repeated short
+> wrapper waits when the host can notify completion. A host yield/session handle is not a queue
+> timeout: keep the same call pending. Use a long supported timeout with transport margin. After an
+> actual interruption or queue timeout reconnect the same receipt with wait_for_result; never resubmit
+> implicitly. To follow a request you do not own, use watch_request; to wait until a repository's
+> queue has drained, use wait_for_queue_empty. list_queues is one-shot discovery, never a polling
+> loop. The server cannot wake a closed session. Without MCP, run one merge-queue result <request_id>
+> --wait --timeout <seconds> invocation.
 
 ## Client setup
 
@@ -154,4 +179,6 @@ Configure the long per-server tool timeout before use: some clients default to 6
 automatically background a long-running MCP call and deliver its completion as a notification; that is client
 behaviour, and the server does not require a task-status loop. The server disables FastMCP dotenv loading
 before import so it cannot consume an application `.env` file. Clients must reload MCP after the
-configuration changes.
+configuration changes. After upgrading the installed package, reload/reconnect MCP in existing sessions
+to receive the updated tools and instructions. Leave durable queue jobs running and reattach their saved
+receipts; reloading the observer does not require stopping a runner or resubmitting.
