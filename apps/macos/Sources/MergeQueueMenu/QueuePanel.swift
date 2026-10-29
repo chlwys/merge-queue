@@ -72,8 +72,8 @@ struct QueuePanel: View {
 
     private func route(request: RequestRecord?, elapsed: String?) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            SpaceArtwork(theme: theme, palette: palette, stage: request?.stageLabel, hasActiveRequest: request != nil, requestName: request?.displayName, elapsed: elapsed, routePosition: request?.routePosition)
-                .frame(height: 164)
+            SpaceArtwork(theme: theme, palette: palette, hasActiveRequest: request != nil, routePosition: request?.routePosition)
+                .frame(height: request == nil ? 164 : 138)
                 .accessibilityLabel(request.map { "\($0.displayName), \($0.stageLabel), \(elapsed ?? "")" } ?? "No active request")
                 .overlay(alignment: .bottomLeading) {
                     if request == nil {
@@ -86,6 +86,19 @@ struct QueuePanel: View {
                             .padding(.leading, 20).padding(.bottom, 5)
                     }
                 }
+            if let request {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(request.displayName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .lineLimit(4).truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled).help(request.displayName)
+                    Text([request.stageLabel, elapsed].compactMap { $0 }.joined(separator: " · "))
+                        .font(.system(size: 11)).foregroundStyle(palette.muted)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20).padding(.top, 2).padding(.bottom, 8)
+            }
         }
     }
 

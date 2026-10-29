@@ -3,10 +3,7 @@ import SwiftUI
 struct SpaceArtwork: View {
     let theme: QueueThemeID
     let palette: QueuePalette
-    let stage: String?
     let hasActiveRequest: Bool
-    let requestName: String?
-    let elapsed: String?
 
     let routePosition: Double?
     // Fixed lifecycle stops come from QueueModel, independent of theme or display wording.
@@ -42,12 +39,6 @@ struct SpaceArtwork: View {
                 if hasActiveRequest {
                     Circle().fill(palette.accent.opacity(0.16)).frame(width: 22, height: 22).position(point)
                     Circle().fill(palette.accent).frame(width: 7, height: 7).position(point)
-                    if let requestName {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(requestName).font(.system(size: 11, weight: .semibold)).lineLimit(1).truncationMode(.middle).help(requestName)
-                            Text([stage, elapsed].compactMap { $0 }.joined(separator: " · ")).font(.system(size: 10)).foregroundStyle(palette.muted).lineLimit(1)
-                        }.frame(width: 130, alignment: .leading).position(x: stop >= 0.5 ? point.x - 82 : min(point.x + 80, w - 68), y: stop > 0.7 ? point.y - 28 : min(point.y + 28, h - 17))
-                    }
                     if theme == .orbital {
                         Rocket(palette: palette).frame(width: 18, height: 24).rotationEffect(.degrees(45)).position(x: point.x + 18, y: point.y - 15)
                     }
