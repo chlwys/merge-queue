@@ -159,7 +159,7 @@ PYTHONDONTWRITEBYTECODE = "1"
 # MERGE_QUEUE_STATE_HOME = "<state-root>"  # only when you installed with a non-default state root
 ```
 
-Claude Code (`.claude.json` / `claude mcp add-json`):
+Claude Code, project-scoped (`.mcp.json`):
 
 ```json
 {
@@ -175,6 +175,18 @@ Claude Code (`.claude.json` / `claude mcp add-json`):
 }
 ```
 
+The project file can be committed with the project. Use an executable path available to collaborators,
+or prefer a user-scoped entry when the executable path is specific to one machine. For a user-scoped registration, use Claude Code's CLI (which writes the
+user configuration for you):
+
+```sh
+claude mcp add --scope user --transport stdio merge-queue -- \
+  /absolute/path/to/tool-bin/merge-queue-mcp
+```
+
+Add the environment shown above through the client's supported configuration if using a custom state root;
+the server itself disables dotenv loading before importing FastMCP.
+
 Configure the long per-server tool timeout before use: some clients default to 60 seconds. Claude Code can
 automatically background a long-running MCP call and deliver its completion as a notification; that is client
 behaviour, and the server does not require a task-status loop. The server disables FastMCP dotenv loading
@@ -182,3 +194,8 @@ before import so it cannot consume an application `.env` file. Clients must relo
 configuration changes. After upgrading the installed package, reload/reconnect MCP in existing sessions
 to receive the updated tools and instructions. Leave durable queue jobs running and reattach their saved
 receipts; reloading the observer does not require stopping a runner or resubmitting.
+
+The `MCP_TIMEOUT` environment setting configures Claude Code's timeout for MCP server startup and is distinct from the
+client's per-tool wall-clock timeout. The server accepts queue observation timeouts up to 82800 seconds;
+configure the client timeout to allow that duration plus transport margin. A 86400000 ms (24 hour) Claude
+per-server timeout is valid.

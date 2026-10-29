@@ -1,134 +1,256 @@
-# merge-queue
+# merge-queue: a local Git merge queue for AI coding agents
 
-A deterministic, local merge queue for Git repositories. Many people or agents work in their own
-worktrees; the queue lands their committed work on one shared branch (usually `main`) one request at a
-time, in first-come order, after validating the **combined** result. An optional trusted policy sends tiny
-presentation changes through an inline fast lane, ahead of FIFO validation. No model is involved on the success
-path, and the queue never modifies a contributor's branch or worktree.
+Run Claude Code, OpenAI Codex, or other coding agents in separate Git worktrees, then integrate their committed work through a shared local merge queue. **merge-queue validates the combined candidate against the current target branch before landing it with a guarded fast-forward.**
+
+Use the CLI from a terminal, connect agents through the Model Context Protocol (MCP), or watch progress in the optional native macOS menu-bar app. The queue engine is deterministic: it calls no model and needs no AI provider API key.
+
+**Python 3.11+ · POSIX · MIT license · Optional SwiftUI app for macOS 13+**
+
+[Quick start](#quick-start) · [Use cases](#when-to-use-merge-queue) · [Claude and Codex](#use-with-claude-code-and-codex) · [macOS app](#native-macos-menu-bar-app) · [Documentation](#documentation)
+
+## When to use merge-queue
+
+Parallel work is useful until several contributors try to update the same integration checkout. A branch can pass its own tests and still fail when combined with a change that landed moments earlier. merge-queue prepares an isolated candidate, checks the combined result, and refreshes it if the target moves.
+
+| Situation | How the queue helps |
+|---|---|
+| Several Claude Code or Codex tasks work on one repository | Each task keeps its own worktree; the normal queue serializes integration into the shared target. |
+| A developer works alongside autonomous coding agents | Humans and agents use the same committed-change workflow and project-owned validation rules. |
+| Two individually valid changes interact | Validation runs after rebasing onto the current target; a moved target triggers refresh and revalidation. |
+| A long agent session disconnects | The request and evidence are durable. Reconnect to the same receipt instead of submitting the work again. |
+| One machine has several active repositories | Repositories have separate queue state and locks. One MCP configuration can discover every installed repository. |
+| You want a quick visual status check | The macOS menu-bar app shows one repository, its active request, elapsed time, waiting work, and recent results. |
+| Small presentation fixes should avoid a broad validation backlog | An optional operator-owned classifier routes eligible changes through a fast lane with focused checks and the same publication guards. |
+
+This is a **local integration tool** for a single machine. It does not manage GitHub pull requests, replace hosted CI, provide a distributed queue, or launch your coding agents. Each repository installation has one integration checkout and one configured target branch, usually `main`.
+
+## How it works
 
 ```text
-merge-queue submit        exact commit -> durable request (FIFO number) -> runner -> Block `tq`
-                          -> land: detached candidate worktree (rebase onto the target)
-                          -> your validation policy runs on the COMBINED candidate
-                          -> fresh checkout checks -> git merge --ff-only in the integration checkout
+committed worktree
+       |
+       v
+stable request ID + durable receipt
+       |
+       v
+normal FIFO queue / trusted inline fast lane
+       |
+       v
+isolated candidate rebased onto current target
+       |
+       v
+project validation policy checks the combined result
+       |
+       v
+fresh checkout checks -> local git merge --ff-only
 ```
 
-What you get:
-
-* **FIFO landing through [`tq`](https://github.com/block/agent-task-queue)** (one queue per repository and
-  target branch), with durable request files, crash recovery and no duplicate publication.
-* **Validation of what will actually land**: the candidate is the contributor's commits rebased onto the
-  current target tip, checked by a policy file that you own. Unknown paths fail closed.
-* **Local Git remains available**: ordinary commits and merges need no special environment variable.
-  The `reference-transaction` guard protects active queue publication and binds its exact receipt and SHAs.
-* **An optional automatic fast lane**: trusted classification and focused checks in an isolated candidate,
-  with the same durable receipt, cleanliness and stale-target guards, without a `tq` task or full suites.
-* **An optional MCP server** (`merge-queue-mcp`) that lets agents submit once and receive the outcome as the
-  result of a single pending tool call, and lets anyone watch a request or wait for a queue to drain.
-
-## Native macOS app
-
-An optional lightweight menu-bar monitor shows one repository at a time, with interchangeable
-Orbital and Minimal themes. See [apps/macos/README.md](apps/macos/README.md) for building and running it.
-
-## Requirements
-
-* Python 3.11 or newer and Git. POSIX only (file locks, process groups). Developed and tested on macOS;
-  nothing macOS-specific is required except the optional launchd plist.
-* [Block's `agent-task-queue`](https://github.com/block/agent-task-queue) **0.4.1** (the `tq` command,
-  Apache-2.0). It is an external dependency of this project and is not vendored or modified here:
-
-  ```sh
-  uv tool install agent-task-queue==0.4.1      # puts `tq` in ~/.local/bin
-  ```
+The normal FIFO scheduler is [Block's agent-task-queue (`tq`)](https://github.com/block/agent-task-queue), used as an unmodified external command. merge-queue adds exact-commit receipts, policy-driven validation, recovery, Git publication guards, and an MCP interface. It is an independent project, not a fork of `tq`.
 
 ## Install
 
-Install the tool into a stable, long-lived environment (not into a task worktree or a temporary directory;
-the installer refuses those because hooks and the runner would point at paths that disappear):
+You need Git, Python 3.11 or newer, and [uv](https://docs.astral.sh/uv/getting-started/installation/). The CLI uses POSIX file locks and process groups; development and acceptance testing have been on macOS. The desktop app is macOS-only.
+
+Install the pinned scheduler and this repository's package:
 
 ```sh
-uv tool install git+https://github.com/chlwys/merge-queue.git
+uv tool install agent-task-queue==0.4.1
+uv tool install 'git+https://github.com/chlwys/merge-queue.git'
 merge-queue --help
 merge-queue-mcp --help
 ```
 
-The dependencies (`fastmcp==4.1.3`, `mcp==2.3.0`, `watchfiles==1.3.0`) are installed with the package.
-The core imports only the Python standard library for ordinary commands and immediate results; a pending
-CLI `--wait` lazily loads `watchfiles` for native filesystem notifications, with no polling fallback.
+For a reviewed, reproducible deployment, pin the Git URL to a chosen commit. The Git-source installation is intentional; do not assume a package with the same name on a package index is this project.
 
-## Quickstart
+The package installs its pinned MCP and file-event dependencies. Install it into a stable tool environment: repository hooks and runners must not point into a temporary directory or disposable linked worktree.
 
-1. Write a validation policy in the integration checkout (see [docs/policy.md](docs/policy.md) and
-   [examples/policy.example.json](examples/policy.example.json)) and check it covers every tracked file:
+## Quick start
 
-   ```sh
-   cd <repo>                                  # the integration checkout, on its target branch
-   mkdir -p .merge-queue && cp <this-repo>/examples/policy.example.json .merge-queue/policy.json
-   merge-queue policy check                   # exit 0 when valid and complete
-   ```
+### 1. Choose the target checkout and a validation policy
 
-2. Install the queue for this repository (writes `mergequeue.*` into the repository's Git config, two Git
-   hooks and a registry entry; see [docs/operations.md](docs/operations.md)):
+Start in the clean checkout that owns your target branch. Other contributors will work in separate worktrees.
 
-   ```sh
-   merge-queue install --runtime-allow data/  # optional: untracked runtime paths that may stay in the checkout
-   merge-queue doctor
-   ```
+```sh
+cd /path/to/your-repository
+mkdir -p .merge-queue
+```
 
-3. From any worktree of the repository, commit and submit:
+Create `.merge-queue/policy.json`. This example runs a Python project's unit tests for **every** changed path; replace the command with your project's real gate:
 
-   ```sh
-   merge-queue submit --wait                  # exit 0 landed, 10 owner action, 11 operator action, ...
-   ```
+```json
+{
+  "version": 1,
+  "rules": [{"match": ["*"], "checks": ["tests"]}],
+  "checks": {
+    "tests": {
+      "argv": ["python3", "-m", "unittest", "discover", "-s", "tests"],
+      "timeout": 900
+    }
+  }
+}
+```
 
-   Failures come back with the conflicting files or the validation log; repair, commit, and run
-   `merge-queue retry <request-id>`.
+Checks run in an isolated candidate worktree. Make sure the required executable and dependencies are available there. For monorepos and selective dependency setup, use the documented [validation policy and planner protocol](docs/policy.md).
 
-A runner is started on demand by `submit`, or you can supervise one yourself (`merge-queue runner`, for
-example under launchd or systemd; see the operations guide).
+### 2. Register the repository
+
+```sh
+git add -- .merge-queue/policy.json
+merge-queue policy check
+git commit -m "Configure merge queue validation"
+merge-queue install
+merge-queue doctor
+```
+
+Commit the policy so it is present in candidates and does not leave an unknown untracked file in the integration checkout. The default target is `main`. Installation writes shared `mergequeue.*` Git configuration, a registry entry, and two Git hooks. Existing hooks are chained. See [operations](docs/operations.md) for another target, runner supervision, runtime path allowances, upgrades, and uninstalling.
+
+Unmatched policy paths fail closed. Keep `merge-queue policy check` in your project checks so newly tracked paths do not surprise the queue later.
+
+### 3. Work, commit, and submit once
+
+Create a task worktree from the target, then make and check your changes there:
+
+```sh
+git worktree add -b feature/search ../your-repository-search main
+cd ../your-repository-search
+# Edit and check your changes, then stage the specific changed paths.
+git add -- path/to/changed-file
+git commit -m "Add search filters"
+
+merge-queue submit --owner search-task --request-id search-task-001 --wait --timeout 7200
+```
+
+Choose and save a unique request ID and a stable owner ID before submission. Both accept 1–64 letters, digits, periods, underscores, and hyphens, starting with a letter or digit. The submitted unit is the exact committed `HEAD`; uncommitted edits are not included. A runner starts on demand unless your installation already supervises one.
+
+Exit `0` means the request landed **locally**. It does not mean a remote push happened.
+
+### 4. Recover the same receipt after interruption
+
+```sh
+merge-queue result search-task-001 --owner search-task --wait --timeout 7200
+```
+
+A timeout, disconnected client, or background task handle does not justify a duplicate submission. Reattach to the saved receipt. For a terminal failure, inspect its result and inbox, repair and commit when required, then retry the failed receipt with a new request ID:
+
+```sh
+merge-queue result search-task-001 --json
+merge-queue inbox --owner search-task --json
+# Repair, check, and commit before retrying an owner failure.
+merge-queue retry search-task-001 --owner search-task --new-request-id search-task-002 --wait --timeout 7200
+```
+
+Keep a single wait pending rather than polling `status` or `result`. CLI and MCP waits use native filesystem notifications.
+
+## Everyday commands
+
+| Command | Purpose |
+|---|---|
+| `merge-queue status --json` | Take one repository queue snapshot. |
+| `merge-queue result REQUEST_ID --json` | Inspect one receipt and its outcome. |
+| `merge-queue result REQUEST_ID --wait --timeout 7200` | Observe an existing receipt until terminal or the actual queue timeout. |
+| `merge-queue inbox --json` | Read action and evidence for the current owner. |
+| `merge-queue retry REQUEST_ID --new-request-id NEW_ID --wait` | Retry a failed request after the required repair. |
+| `merge-queue doctor` | Diagnose installation, queue, and publication readiness. |
+| `merge-queue policy check` | Check policy structure and tracked-file coverage. |
+| `merge-queue uninstall` | Remove queue configuration/hooks while preserving durable state. |
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Landed |
+| `10` | Owner action, such as a conflict or failed validation |
+| `11` | Operator action, such as checkout or policy readiness |
+| `12` | Receipt superseded by a retry |
+| `20` | Infrastructure failure |
+| `30` | Still pending |
+
+See [architecture and exit codes](docs/architecture.md) for the complete state model and other command errors.
+
+## Use with Claude Code and Codex
+
+Agents can use the CLI directly or connect the installed `merge-queue-mcp` stdio server. A single server configuration can serve all registered repositories; worktrees of the same repository share its queue. Different repositories retain independent state and normal FIFO queues.
+
+The MCP interface is small:
+
+| Tool | Purpose |
+|---|---|
+| `submit` | Submit committed work once and wait on its durable receipt. |
+| `wait_for_result` | Reattach to your receipt after a real interruption. |
+| `retry` | Retry your failed receipt after repair, using a new saved ID. |
+| `watch_request` | Observe another owner's request without resubmitting it. |
+| `wait_for_queue_empty` | Wait for one repository's nonterminal requests to drain. |
+| `list_queues` | Discover registered repositories in one snapshot. |
+
+Follow the [Claude Code and Codex setup guide](docs/agents.md) for copyable client configurations, timeouts, and a repository instruction snippet. [MCP reference](docs/mcp.md) documents every tool and reconnect contract.
+
+For contributors to this project, [AGENTS.md](AGENTS.md) provides the source map and checks. [CLAUDE.md](CLAUDE.md) imports the same instructions. [llms.txt](llms.txt) is a compact documentation index for tools or readers that choose to consume it; it is not required for the queue to work.
+
+## Native macOS menu-bar app
+
+The optional SwiftUI app lets you inspect the queue without returning to a terminal. It shows one repository at a time, with a small repository selector at the bottom. The default Orbital theme draws a satellite-to-Earth route, rocket, active-request dot, readable multiline title, lifecycle stage, and elapsed time. A Minimal theme is included; themes and artwork are separate from queue reading.
+
+<img src="docs/images/macos-menu-bar.svg" width="390" alt="Native macOS Merge Queue menu-bar panel with a satellite, curved flight path, rocket, active request title and elapsed time, plus a repository dropdown at the bottom.">
+
+*Orbital theme illustration with synthetic request names.*
+
+Build it from a clone with Apple's Command Line Tools or Xcode:
+
+```sh
+git clone https://github.com/chlwys/merge-queue.git
+cd merge-queue/apps/macos
+scripts/build-app.sh
+open "dist/Merge Queue.app"
+```
+
+No Electron, bundled browser, or third-party Swift package is required. The resulting app is ad-hoc signed for local use; this repository does not currently provide a notarized download. The monitor reads queue records and cannot submit, cancel, or change a merge.
+
+Observation runs while the panel is open, using native file events. Reopening refreshes the snapshot. Only an active request enables the once-per-second elapsed label. Route positions indicate preparing, validating, and landing stages, not a measured percentage or an ETA.
+
+See the [macOS app guide](apps/macos/README.md) for state-root configuration, theme boundaries, build-tool compatibility, previews, and tests.
 
 ## Safety model
 
-* Queue publications move the target only by `git merge --ff-only` of a candidate that was validated against the exact
-  tip it extends, with fresh checks of the integration checkout (branch, clean tracked files, no clashing
-  untracked or ignored paths) immediately before publication.
-* The Git hook binds every ref transaction of a publication to that publication (authorised old and new
-  SHAs, held integration lock, expiry). Ordinary local target updates are allowed when no queue publication
-  holds the lock. Remote target pushes still require `MERGE_QUEUE_PUSH_APPROVED=1`; the deprecated
-  `MERGE_QUEUE_MANUAL` flag grants no push approval. Git may stage a merge before a hook refusal; this guard
-  does not serialize arbitrary checkout writes. Inspect the checkout after any rejected merge.
-* Policy is read from the integration checkout, never from a candidate, so a change cannot weaken its own
-  gate.
-* Process groups are signalled only after pid, start time and argv are verified; nothing is ever deleted
-  from `tq`'s database; the queue never resets the integration checkout.
+- **Combined-candidate validation:** the policy runs against a candidate rebased onto the current target, then runs again if the candidate must be refreshed.
+- **Trusted policy ownership:** the integration checkout supplies the policy. A submitted candidate cannot change the rules that judge itself.
+- **Fresh publication checks:** guarded local fast-forwards check branch, tracked cleanliness, unrecognized untracked files, and path overlap with runtime data. The queue never resets your integration checkout to manufacture cleanliness.
+- **Durable recovery:** receipts, acceptance intents, and process identities support reconnect and bounded crash recovery. Failures return evidence to the owner or operator.
+- **Coordinated local Git:** ordinary commits and merges remain possible while no queue publication holds the integration lock. The hooks are same-user coordination guards, not a security sandbox for untrusted contributors.
+- **Separate remote publication:** target pushes require explicit approval via `MERGE_QUEUE_PUSH_APPROVED=1`. Local queue success does not authorize publishing code remotely.
+- **One local machine:** one integration checkout and configured target per repository installation. There is no distributed runner, multi-host coordination, or guarantee that a closed agent session will be awakened.
+
+Project validation commands execute code from the candidate. Use trusted repositories and policies appropriate to your environment. Details and recovery instructions are in [architecture](docs/architecture.md) and [operations](docs/operations.md).
 
 ## Documentation
 
-| Document | Contents |
+| Guide | Contents |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | Request lifecycle, state layout, locks, publication, recovery, exit codes |
-| [docs/policy.md](docs/policy.md) | Policy file, path routing, the partial-testing planner protocol, `policy check` |
-| [docs/mcp.md](docs/mcp.md) | The global MCP server: tools, events, client setup |
-| [docs/operations.md](docs/operations.md) | Install, state root, registry, runner supervision, direct Git, rollback |
+| [Agent adoption](docs/agents.md) | Claude Code and Codex setup, portable instructions, receipt discipline |
+| [MCP reference](docs/mcp.md) | Tool arguments, events, timeouts, ownership, reconnect behavior |
+| [Operations](docs/operations.md) | Installation, state roots, registry, supervision, direct Git, uninstall |
+| [Validation policy](docs/policy.md) | Rules, checks, selective setup, trusted inline fast lane |
+| [Architecture](docs/architecture.md) | Request lifecycle, scheduling, candidate validation, publication, recovery |
+| [macOS app](apps/macos/README.md) | Native monitor build, themes, data access, visual development |
+| [Example policy](examples/policy.example.json) | An adaptable starting point, not a universal production gate |
+| [Agent index](llms.txt) | Short machine-readable map of the documentation |
 
-## Development
+## Development and contributing
 
 ```sh
 uv sync --locked
 uv run python -m unittest discover -s tests
+python3 scripts/audit_publication.py
 ```
 
-The suite needs the real `tq` (0.4.1) on `PATH` or at `~/.local/bin/tq` (or `MERGE_QUEUE_TQ`). Every test
-uses temporary fixture repositories with their own HOME, state root and `tq` data directory; nothing touches
-a real installation.
+The Python suite requires the real `tq` 0.4.1 command. Tests create temporary Git repositories with isolated HOME, state roots, and scheduler data. They do not use your installed live queues. For native app tests with Swift 6:
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for privacy checks and contribution guidance, and
-[SECURITY.md](SECURITY.md) for vulnerability reporting.
+```sh
+cd apps/macos
+scripts/swift.sh test --disable-xctest
+```
 
-## Credits and license
+Keep behavior changes focused, add relevant regression coverage, and update the matching guide. Preserve receipt ownership, target-freshness checks, policy authority, and publication guards. Use [GitHub issues](https://github.com/chlwys/merge-queue/issues) for bugs and feature requests; include versions, the failure type, and redacted evidence rather than private source or credentials.
 
-Scheduling is done by Block's [`agent-task-queue`](https://github.com/block/agent-task-queue) (`tq`),
-Apache-2.0, used as an unmodified external command-line tool. This project is independent of Block.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and privacy checks, and [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
-Licensed under the MIT License; see [LICENSE](LICENSE).
+## License and credits
+
+merge-queue is [MIT licensed](LICENSE). Scheduling uses Block's [agent-task-queue](https://github.com/block/agent-task-queue) 0.4.1, an unmodified Apache-2.0 external dependency. The native app uses Apple's SwiftUI and AppKit. This project is independent of Block, Anthropic, and OpenAI.

@@ -1,0 +1,27 @@
+# merge-queue
+
+> A deterministic local Git merge queue for parallel coding agents and developers. CLI, stdio MCP adapter for Claude Code/Codex, and optional native macOS menu-bar monitor.
+
+## Start here
+
+- [README](https://github.com/chlwys/merge-queue/blob/main/README.md): purpose, use cases, requirements, Git-source installation, complete first submission, limits and recovery.
+- [Agent adoption](https://github.com/chlwys/merge-queue/blob/main/docs/agents.md): Codex and Claude Code configuration, stable owners and receipts, reconnect and retry instructions.
+- [MCP reference](https://github.com/chlwys/merge-queue/blob/main/docs/mcp.md): exact tool contracts, shared registry discovery, events and timeouts.
+
+## Operating the queue
+
+- [Validation policy](https://github.com/chlwys/merge-queue/blob/main/docs/policy.md): trusted rules/checks, full path coverage, selective setup and inline fast-lane classification.
+- [Operations](https://github.com/chlwys/merge-queue/blob/main/docs/operations.md): installation, separate repository queues, state paths, runner supervision and uninstall.
+- [Architecture](https://github.com/chlwys/merge-queue/blob/main/docs/architecture.md): request states, Git publication guards, crash recovery and exit codes.
+- [Example policy](https://github.com/chlwys/merge-queue/blob/main/examples/policy.example.json): illustrative configuration; adapt to the actual project's checks.
+
+## macOS and contributing
+
+- [macOS app](https://github.com/chlwys/merge-queue/blob/main/apps/macos/README.md): native SwiftUI menu-bar monitor, build requirements, interchangeable themes and read-only observation.
+- [Contributor instructions](https://github.com/chlwys/merge-queue/blob/main/AGENTS.md): source map, checks and invariants for work on this repository.
+- [Claude entry point](https://github.com/chlwys/merge-queue/blob/main/CLAUDE.md): imports shared contributor guidance.
+- [License](https://github.com/chlwys/merge-queue/blob/main/LICENSE): MIT; tq is a separate Apache-2.0 dependency.
+
+## Key facts
+
+The queue calls no model and needs no AI provider API key. Submit an exact committed HEAD once with saved request and owner IDs. A wait observes the same receipt; interruption is not permission to resubmit. Normal FIFO scheduling uses the external tq command; optional operator-owned inline work shares publication guards. Worktrees of one repository share its queue. Each installation has one configured target and integration checkout on one machine. Remote push approval is separate from local landing. The desktop app is a read-only local monitor. This file is an optional index, not a promise that any particular crawler or agent will discover or ingest it automatically.

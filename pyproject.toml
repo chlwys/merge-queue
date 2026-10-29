@@ -5,10 +5,18 @@ build-backend = "hatchling.build"
 [project]
 name = "merge-queue"
 version = "0.2.0"
-description = "Deterministic local merge queue for Git repositories, with a global MCP completion adapter"
+description = "Local Git merge queue for parallel coding agents, with durable MCP receipts and a native macOS monitor"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
+keywords = ["merge-queue", "git-worktrees", "coding-agents", "mcp", "claude-code", "codex", "macos"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Software Development :: Quality Assurance",
+]
 # Ordinary core commands use the standard library; pending CLI waits lazily load watchfiles.
 # The MCP adapter also needs fastmcp and mcp.
 dependencies = [
@@ -16,6 +24,12 @@ dependencies = [
     "mcp==2.3.0",
     "watchfiles==1.3.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/chlwys/merge-queue"
+Documentation = "https://github.com/chlwys/merge-queue#readme"
+Repository = "https://github.com/chlwys/merge-queue"
+Issues = "https://github.com/chlwys/merge-queue/issues"
 
 [project.scripts]
 merge-queue = "merge_queue.core:cli"
