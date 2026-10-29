@@ -14,7 +14,7 @@ public struct SnapshotReader: Sendable {
     public static func repositoryID(commonDirectory: String) -> String {
         SHA256.hash(data: Data(commonDirectory.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
     }
-    public func read(selectedID: String?, previous: DashboardSnapshot? = nil) -> DashboardSnapshot {
+    public func read(selectedID: String?, previous: DashboardSnapshot? = nil, now: Date = Date()) -> DashboardSnapshot {
         var snapshot = DashboardSnapshot()
         do {
             var issues = 0
@@ -41,10 +41,14 @@ public struct SnapshotReader: Sendable {
                     var byID: [String: RequestRecord] = [:]
                     for file in try jsonFiles(directory.appendingPathComponent("requests"), allowMissing: false) {
                         do {
-                            let request = try decode(RequestRecord.self, at: file)
+                            var request = try decode(RequestRecord.self, at: file)
                             guard request.id == file.deletingPathExtension().lastPathComponent,
                                   request.repository == repo.commonDirectory else {
                                 throw ReadFailure.message("A request does not match its repository.")
+                            }
+                            if request.isFailure {
+                                request.firstObservedAt = previous?.selectedRepositoryID == repo.id
+                                    ? (previous?.requests.first { $0.id == request.id }?.firstObservedAt ?? now) : now
                             }
                             byID[request.id] = request
                         } catch CocoaError.fileReadNoSuchFile {

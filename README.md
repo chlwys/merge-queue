@@ -19,7 +19,7 @@ Parallel work is useful until several contributors try to update the same integr
 | Two individually valid changes interact | Validation runs after rebasing onto the current target; a moved target triggers refresh and revalidation. |
 | A long agent session disconnects | The request and evidence are durable. Reconnect to the same receipt instead of submitting the work again. |
 | One machine has several active repositories | Repositories have separate queue state and locks. One MCP configuration can discover every installed repository. |
-| You want a quick visual status check | The macOS menu-bar app shows one repository, its active request, elapsed time, waiting work, and recent results. |
+| You want a quick visual status check | The macOS menu-bar app shows one repository, its active request and elapsed time, waiting work on Earth, and station completion details. |
 | Small presentation fixes should avoid a broad validation backlog | An optional operator-owned classifier routes eligible changes through a fast lane with focused checks and the same publication guards. |
 
 This is a **local integration tool** for a single machine. It does not manage GitHub pull requests, replace hosted CI, provide a distributed queue, or launch your coding agents. Each repository installation has one integration checkout and one configured target branch, usually `main`.
@@ -186,9 +186,9 @@ For contributors to this project, [AGENTS.md](AGENTS.md) provides the source map
 
 ## Native macOS menu-bar app
 
-The optional SwiftUI app lets you inspect the queue without returning to a terminal. It shows one repository at a time, with a small repository selector at the bottom. The default Orbital theme draws a satellite-to-Earth route, rocket, active-request dot, readable multiline title, lifecycle stage, and elapsed time. A Minimal theme is included; themes and artwork are separate from queue reading.
+The optional SwiftUI app lets you inspect the queue without returning to a terminal. It shows one repository at a time, with a small repository selector at the bottom. The default Orbital theme sends a rocket from Earth toward a space station being built by successful merges. Earth shows the waiting-request count; hover or click Earth for remaining work, the station for retained completions, or a temporary debris field for failures. The active title, stage, elapsed time, and a conservative estimated time to clear the work appear below the scene. A Minimal theme is included; themes and artwork are separate from queue reading.
 
-<img src="docs/images/macos-menu-bar.svg" width="390" alt="Native macOS Merge Queue menu-bar panel with a satellite, curved flight path, rocket, active request title and elapsed time, plus a repository dropdown at the bottom.">
+<img src="docs/images/macos-menu-bar.svg" width="390" alt="Native macOS Merge Queue menu-bar panel with Earth with a waiting count, a curved route toward a space station, active request title and elapsed time, a queue-time estimate, and a bottom repository dropdown.">
 
 *Orbital theme illustration with synthetic request names.*
 
@@ -203,7 +203,7 @@ open "dist/Merge Queue.app"
 
 No Electron, bundled browser, or third-party Swift package is required. The resulting app is ad-hoc signed for local use; this repository does not currently provide a notarized download. The monitor reads queue records and cannot submit, cancel, or change a merge.
 
-Observation runs while the panel is open, using native file events. Reopening refreshes the snapshot. Only an active request enables the once-per-second elapsed label. Route positions indicate preparing, validating, and landing stages, not a measured percentage or an ETA.
+Observation runs while the panel is open, using native file events. Reopening refreshes the snapshot. Only an active request enables the once-per-second elapsed label. Debris disappears visually after five minutes without deleting failure evidence. The queue-time estimate learns from recent successful normal merges and stays unavailable for insufficient history or concurrent/atypical work. Route positions indicate lifecycle stages rather than a measured percentage.
 
 See the [macOS app guide](apps/macos/README.md) for state-root configuration, theme boundaries, build-tool compatibility, previews, and tests.
 

@@ -73,7 +73,7 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
         catch { fputs("Cannot create preview directory: \(error)\n", stderr); exit(1) }
         var windows: [(String, NSWindow, NSView)] = []
-        for scenario in ["active", "idle", "queued", "failed", "multiple", "long", "empty", "error", "minimal"] {
+        for scenario in ["active", "idle", "queued", "failed", "multiple", "long", "empty", "error", "minimal", "learning", "debris-expired", "dense", "preparing"] {
             let view = NSHostingView(rootView: QueuePanel(
                 snapshot: PreviewData.snapshot(scenario == "minimal" ? "active" : scenario),
                 theme: scenario == "minimal" ? .minimal : .orbital, onSelectRepository: { _ in },
@@ -106,23 +106,36 @@ enum PreviewData {
             checkout: "/tmp/moonbase", stateDirectory: "/tmp/merge-queue/abcdef012345", target: "refs/heads/main")
         let now = Date()
         var requests: [RequestRecord] = []
-        if ["active", "long", "multiple"].contains(scenario) {
-            requests.append(RequestRecord(id: "mq-synthetic-active", state: "running", phase: "validating",
-                sourceBranch: scenario == "long" ? "codex/a-very-long-request-name-that-should-truncate-without-moving-the-repository-picker" : "codex/native-menu-bar",
-                sequence: 1, submittedAt: now.addingTimeInterval(-155), startedAt: now.addingTimeInterval(-92)))
-            requests.append(RequestRecord(id: "mq-synthetic-next", state: "queued", sourceBranch: "codex/smoother-orbits", sequence: 2, submittedAt: now))
+        if !["empty", "learning"].contains(scenario) {
+            for (index, name) in ["docking-port", "solar-array", "habitat-module"].enumerated() {
+                let finish = now.addingTimeInterval(-Double(1500 - index * 500))
+                requests.append(RequestRecord(id: "mq-complete-\(index)", state: "landed",
+                    sourceBranch: "codex/\(name)", sequence: index + 1,
+                    startedAt: finish.addingTimeInterval(-Double(180 + index * 60)), finishedAt: finish))
+            }
+        }
+        if ["active", "long", "multiple", "learning", "dense", "preparing"].contains(scenario) {
+            requests.append(RequestRecord(id: "mq-synthetic-active", state: "running",
+                phase: scenario == "preparing" ? "preparing" : "validating",
+                sourceBranch: scenario == "long" ? "codex/a-very-long-request-name-that-should-wrap-without-moving-the-repository-picker" : "codex/station-construction",
+                sequence: 4, submittedAt: now.addingTimeInterval(-155), startedAt: now.addingTimeInterval(-92)))
+            for index in 0..<(scenario == "dense" ? 25 : 2) {
+                requests.append(RequestRecord(id: "mq-waiting-\(index)", state: "queued",
+                    sourceBranch: index == 0 ? "codex/smoother-orbits" : "codex/station-module-\(index)",
+                    sequence: 5 + index, submittedAt: now))
+            }
         }
         if scenario == "multiple" {
             requests.append(RequestRecord(id: "mq-synthetic-inline", state: "running", phase: "publishing",
-                sourceBranch: "codex/quick-copy-fix", sequence: 3, startedAt: now.addingTimeInterval(-15), lane: "inline"))
+                sourceBranch: "codex/quick-copy-fix", sequence: 30, startedAt: now.addingTimeInterval(-15), lane: "inline"))
         }
         if scenario == "queued" {
             requests.append(RequestRecord(id: "mq-synthetic-waiting", state: "queued",
-                sourceBranch: "codex/ready-for-launch", sequence: 1, submittedAt: now.addingTimeInterval(-63)))
+                sourceBranch: "codex/ready-for-launch", sequence: 4, submittedAt: now.addingTimeInterval(-63)))
         }
-        if scenario == "failed" {
+        if ["failed", "debris-expired"].contains(scenario) {
             requests.append(RequestRecord(id: "mq-synthetic-failed", state: "validation_failed", sourceBranch: "codex/orbit-controls",
-                sequence: 1, submittedAt: now.addingTimeInterval(-200), finishedAt: now.addingTimeInterval(-45),
+                sequence: 4, submittedAt: now.addingTimeInterval(-600), finishedAt: now.addingTimeInterval(scenario == "failed" ? -45 : -301),
                 failureMessage: "Validation needs attention."))
         }
         return DashboardSnapshot(repositories: scenario == "empty" ? [] : [repo, second],

@@ -15,6 +15,8 @@ final class QueueStore: ObservableObject {
     private var visible = false
     private var selection: String?
     private var watchKey = ""
+    private var recentFailures: [String: [String: RequestRecord]] = [:]
+    private var failureFirstSeen: [String: [String: Date]] = [:]
     private let defaults: UserDefaults
     private let preview: DashboardSnapshot?
 
@@ -72,6 +74,34 @@ final class QueueStore: ObservableObject {
         pending = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: item)
     }
+    private func withFailureDebris(_ input: DashboardSnapshot, at now: Date) -> DashboardSnapshot {
+        var result = input
+        recentFailures = recentFailures.mapValues { records in
+            records.filter { _, request in
+                guard let origin = request.debrisOrigin else { return false }
+                return now.timeIntervalSince(origin) < DashboardSnapshot.debrisLifetime
+            }
+        }.filter { !$0.value.isEmpty }
+        guard let repository = result.selectedRepositoryID else { return result }
+        var records = recentFailures[repository] ?? [:]
+        var seen = failureFirstSeen[repository] ?? [:]
+        let present = Set(result.requests.filter(\.isFailure).map(\.id))
+        for index in result.requests.indices where result.requests[index].isFailure {
+            let id = result.requests[index].id
+            let first = seen[id] ?? records[id]?.firstObservedAt ?? result.requests[index].firstObservedAt ?? now
+            seen[id] = first
+            result.requests[index].firstObservedAt = first
+            let request = result.requests[index]
+            if let origin = request.debrisOrigin, now.timeIntervalSince(origin) < DashboardSnapshot.debrisLifetime {
+                records[id] = request
+            }
+        }
+        failureFirstSeen[repository] = seen.filter { present.contains($0.key) || records[$0.key] != nil }
+        recentFailures[repository] = records
+        result.transientFailures = Array(records.values)
+        return result
+    }
+
     func refresh() {
         guard preview == nil else { return }
         generation += 1
@@ -81,7 +111,7 @@ final class QueueStore: ObservableObject {
             let result = reader.read(selectedID: selected, previous: previous)
             DispatchQueue.main.async {
                 guard let self, self.generation == expected else { return }
-                self.snapshot = result
+                self.snapshot = self.withFailureDebris(result, at: Date())
                 self.selection = result.selectedRepositoryID
                 self.updateWatcher()
             }

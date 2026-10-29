@@ -31,6 +31,8 @@ public struct RequestRecord: Decodable, Identifiable, Equatable, Sendable {
     public let failureMessage: String?
     public let repository: String?
     public let lane: String?
+    /// In-memory observation only, never written to queue records.
+    public var firstObservedAt: Date? = nil
     public var displayName: String { sourceBranch?.replacingOccurrences(of: "refs/heads/", with: "") ?? id }
     public static let terminalStates: Set<String> = ["landed", "conflict", "validation_failed", "blocked", "infra_failed", "superseded"]
     public var isActive: Bool { !Self.terminalStates.contains(state) && !isWaiting }
@@ -61,7 +63,8 @@ public struct RequestRecord: Decodable, Identifiable, Equatable, Sendable {
     }
     public func elapsed(at now: Date) -> String {
         guard let start = startedAt ?? submittedAt else { return "—" }
-        let seconds = max(0, Int((finishedAt ?? now).timeIntervalSince(start)))
+        let end = Self.terminalStates.contains(state) ? (finishedAt ?? now) : now
+        let seconds = max(0, Int(end.timeIntervalSince(start)))
         if seconds >= 3600 { return "\(seconds / 3600)h \((seconds % 3600) / 60)m" }
         if seconds >= 60 { return "\(seconds / 60)m \(seconds % 60)s" }
         return "\(seconds)s"
@@ -69,10 +72,11 @@ public struct RequestRecord: Decodable, Identifiable, Equatable, Sendable {
     public init(id: String, state: String, phase: String? = nil, sourceBranch: String? = nil,
                 sequence: Int = 0, submittedAt: Date? = nil, startedAt: Date? = nil,
                 finishedAt: Date? = nil, failureMessage: String? = nil, repository: String? = nil,
-                lane: String? = nil) {
+                lane: String? = nil, firstObservedAt: Date? = nil) {
         self.id = id; self.state = state; self.phase = phase; self.sourceBranch = sourceBranch
         self.sequence = sequence; self.submittedAt = submittedAt; self.startedAt = startedAt
         self.finishedAt = finishedAt; self.failureMessage = failureMessage; self.repository = repository; self.lane = lane
+        self.firstObservedAt = firstObservedAt
     }
     enum CodingKeys: String, CodingKey {
         case id = "request_id", state, phase, sourceBranch = "source_branch", sequence = "seq"
@@ -92,7 +96,8 @@ public struct RequestRecord: Decodable, Identifiable, Equatable, Sendable {
         let result = try c.decodeIfPresent(Result.self, forKey: .result)
         startedAt = QueueDate.parse(timing?.started_at)
         let acknowledged = try c.decodeIfPresent(String.self, forKey: .acknowledgedAt)
-        finishedAt = QueueDate.parse(result?.finished_at ?? timing?.finished_at) ?? QueueDate.parse(acknowledged)
+        finishedAt = Self.terminalStates.contains(state)
+            ? (QueueDate.parse(result?.finished_at ?? timing?.finished_at) ?? QueueDate.parse(acknowledged)) : nil
         failureMessage = result?.message ?? result?.failure_type
         repository = try c.decodeIfPresent(String.self, forKey: .repository)
         lane = try c.decodeIfPresent(String.self, forKey: .lane)
@@ -114,6 +119,7 @@ public struct DashboardSnapshot: Sendable {
     public var repositories: [RepositoryRecord]
     public var selectedRepositoryID: String?
     public var requests: [RequestRecord]
+    public var transientFailures: [RequestRecord] = []
     public var warning: String?
     public var isLoading: Bool
     public var selectedRepository: RepositoryRecord? { repositories.first { $0.id == selectedRepositoryID } }
@@ -127,8 +133,8 @@ public struct DashboardSnapshot: Sendable {
             .sorted { ($0.finishedAt ?? .distantPast) > ($1.finishedAt ?? .distantPast) }.prefix(3))
     }
     public init(repositories: [RepositoryRecord] = [], selectedRepositoryID: String? = nil,
-                requests: [RequestRecord] = [], warning: String? = nil, isLoading: Bool = false) {
+                requests: [RequestRecord] = [], transientFailures: [RequestRecord] = [], warning: String? = nil, isLoading: Bool = false) {
         self.repositories = repositories; self.selectedRepositoryID = selectedRepositoryID
-        self.requests = requests; self.warning = warning; self.isLoading = isLoading
+        self.requests = requests; self.transientFailures = transientFailures; self.warning = warning; self.isLoading = isLoading
     }
 }
