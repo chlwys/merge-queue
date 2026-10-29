@@ -8,3 +8,9 @@ build/
 # Native app build products
 apps/macos/.build/
 apps/macos/.swiftpm/
+
+# Local credentials and machine metadata
+.env
+.env.*
+!.env.example
+.DS_Store

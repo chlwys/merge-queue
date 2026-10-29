@@ -48,7 +48,7 @@ Install the tool into a stable, long-lived environment (not into a task worktree
 the installer refuses those because hooks and the runner would point at paths that disappear):
 
 ```sh
-uv tool install <path-or-git-url-of-this-repository>
+uv tool install git+https://github.com/chlwys/merge-queue.git
 merge-queue --help
 merge-queue-mcp --help
 ```
@@ -115,13 +115,16 @@ example under launchd or systemd; see the operations guide).
 ## Development
 
 ```sh
-uv sync
+uv sync --locked
 uv run python -m unittest discover -s tests
 ```
 
 The suite needs the real `tq` (0.4.1) on `PATH` or at `~/.local/bin/tq` (or `MERGE_QUEUE_TQ`). Every test
 uses temporary fixture repositories with their own HOME, state root and `tq` data directory; nothing touches
 a real installation.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for privacy checks and contribution guidance, and
+[SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Credits and license
 

@@ -23,3 +23,7 @@ merge-queue-mcp = "merge_queue.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/merge_queue"]
+
+[tool.hatch.build.targets.sdist]
+# Linked worktrees use a .git pointer file; never ship its local checkout path.
+exclude = ["/.git"]
