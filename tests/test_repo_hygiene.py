@@ -67,6 +67,49 @@ class RepoHygiene(unittest.TestCase):
 
 
 class HistoryAudit(unittest.TestCase):
+    def test_reviewed_screenshot_requires_exact_bytes_in_worktree_and_history(self):
+        image_data = (ROOT / "docs/images/macos-menu-bar.png").read_bytes()
+        with tempfile.TemporaryDirectory(prefix="mq-image-privacy-") as directory:
+            root = Path(directory)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=root, check=True, env=env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+            git("init", "-q")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            (root / "safe.txt").write_text("safe fixture\n")
+            git("add", ".")
+            git("commit", "-qm", "safe")
+            image = root / "capture.png"
+            image.write_bytes(image_data)
+            report = audit(root)
+            self.assertTrue(report["passed"])
+            self.assertIn("worktree:capture.png", report["reviewed_binary_objects_or_files"])
+            git("add", ".")
+            git("commit", "-qm", "reviewed synthetic capture")
+            report = audit(root)
+            self.assertTrue(report["passed"])
+            self.assertTrue(any(p.startswith("blob:") for p in report["reviewed_binary_objects_or_files"]))
+
+            # Neither a known filename nor the PNG extension approves changed content.
+            image.write_bytes(image_data + b"\x00")
+            self.assertIn("worktree:capture.png", audit(root)["binary_objects_or_files"])
+            git("add", ".")
+            git("commit", "-qm", "unreviewed change")
+            image.write_bytes(image_data)
+            git("add", ".")
+            git("commit", "-qm", "restore reviewed capture")
+            report = audit(root)
+            self.assertFalse(report["passed"])
+            self.assertTrue(any(p.startswith("blob:") for p in report["binary_objects_or_files"]))
+            (root / "other.png").write_bytes(b"\xff\x00unreviewed fixture")
+            self.assertIn("worktree:other.png", audit(root)["binary_objects_or_files"])
+
     def test_removed_historical_leak_and_dangling_objects_are_checked_without_values(self):
         with tempfile.TemporaryDirectory(prefix="mq-privacy-") as directory:
             root = Path(directory)

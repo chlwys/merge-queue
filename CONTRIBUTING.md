@@ -29,7 +29,11 @@ CI scans full Git history and the working tree for absolute home paths and non-p
 email addresses, and scans history with Gitleaks. The GitHub noreply attribution already
 in this repository is intentional. Synthetic addresses must use a reserved example domain.
 The audit prints finding locations and categories, without printing matched values.
-Binary files require separate inspection and cause the text audit to fail for review.
+Binary files require separate inspection and fail the text audit unless their exact SHA-256
+is recorded in `scripts/audit_publication.py`. The README screenshot is an inspected native
+capture with synthetic queue data and nonessential metadata removed. Updating it requires
+inspecting the new image and metadata before recording its digest; altered or unrelated
+binaries still fail in both the worktree and Git history.
 
 Run `python3 scripts/audit_publication.py --all-objects` for a local audit that also covers
 reflog-only and dangling objects. Gitleaks is a separate dependency. With Gitleaks 8.30.1 installed, scan the complete history locally:

@@ -7,6 +7,7 @@ is a separate Gitleaks check; this is not a general personal-information detecto
 """
 import argparse
 from collections import Counter
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,12 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-
 ALLOWED_EMAIL_DOMAINS = ("example.invalid", "example.com", "example.org", "example.net")
 PUBLIC_EMAIL_DOMAINS = ("noreply.github.com", "users.noreply.github.com")
 METADATA_EMAILS = {"noreply" + "@anthropic.com"}
+# Exact reviewed asset bytes, not an extension or directory exemption. The capture uses
+# synthetic --render-previews data from 69e22e5 and has nonessential metadata removed.
+REVIEWED_BINARY_SHA256 = {
+    # docs/images/macos-menu-bar.png
+    "3f0319e835067b0e2b0bd765e1272d3c40660385432cbdec965a71c8c6710a9a",
+}
 
 
 def allowed_email(address):
@@ -69,15 +76,20 @@ def audit(root, all_objects=False):
     if any(kind not in ("blob", "tree", "commit", "tag") for _, kind in objects):
         raise ValueError("An object is missing or unreadable; audit is incomplete.")
     counts = Counter(kind for _, kind in objects)
-    findings, binaries = [], []
+    findings, binaries, reviewed_binaries = [], [], []
+
+    def inspect(data, location, metadata=False):
+        found, binary = inspect_text(data, location, metadata)
+        findings.extend(found)
+        if binary:
+            target = reviewed_binaries if hashlib.sha256(data).hexdigest() in REVIEWED_BINARY_SHA256 else binaries
+            target.append(location)
+
     for oid, kind in objects:
         if kind not in ("blob", "commit", "tag"):
             continue
         location = kind + ":" + oid
-        found, binary = inspect_text(git("cat-file", kind, oid), location, kind in ("commit", "tag"))
-        findings.extend(found)
-        if binary:
-            binaries.append(location)
+        inspect(git("cat-file", kind, oid), location, kind in ("commit", "tag"))
     names = git("ls-files", "-z", "--cached", "--others", "--exclude-standard").split(b"\0")
     worktree_files = 0
     for raw in filter(None, names):
@@ -87,13 +99,11 @@ def audit(root, all_objects=False):
             continue
         worktree_files += 1
         data = os.fsencode(os.readlink(path)) if path.is_symlink() else path.read_bytes()
-        found, binary = inspect_text(data, "worktree:" + name)
-        findings.extend(found)
-        if binary:
-            binaries.append("worktree:" + name)
+        inspect(data, "worktree:" + name)
     return {"head": head, "scope": "all_local_objects" if all_objects else "all_refs",
             "refs": refs, "objects": dict(counts), "worktree_files": worktree_files,
-            "binary_objects_or_files": binaries, "findings": findings,
+            "binary_objects_or_files": binaries,
+            "reviewed_binary_objects_or_files": reviewed_binaries, "findings": findings,
             "passed": not findings and not binaries}
 
 

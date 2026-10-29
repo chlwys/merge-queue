@@ -188,9 +188,9 @@ For contributors to this project, [AGENTS.md](AGENTS.md) provides the source map
 
 The optional SwiftUI app lets you inspect the queue without returning to a terminal. Its compact 320 × 300-point panel shows one repository at a time; the hamburger menu contains the repository chooser. The default Orbital theme sends a rocket from Earth toward a space station being built by successful merges. Earth shows only a nonzero waiting-request number; hover or click Earth for remaining work, the station for retained completions, or a temporary debris field for failures. The active title, stage, elapsed time, and a conservative estimated time to clear the work appear below the scene. A Minimal theme is included; themes and artwork are separate from queue reading.
 
-<img src="docs/images/macos-menu-bar.svg" width="320" alt="Native macOS Merge Queue menu-bar panel with Earth with a waiting count, a curved route toward a space station, active request title and elapsed time, a queue-time estimate, and a hamburger menu containing repository selection.">
+<img src="docs/images/macos-menu-bar.png" width="320" alt="Screenshot of the compact macOS Merge Queue app with a hamburger menu, a symmetric station, a rocket on a curved path from Earth, two pending requests, and active merge timing.">
 
-*Orbital theme illustration with synthetic request names.*
+*Actual native app capture of the Orbital theme, using synthetic queue data.*
 
 Build it from a clone with Apple's Command Line Tools or Xcode:
 
