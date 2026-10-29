@@ -18,9 +18,9 @@ The bundle is ad-hoc signed for local use. Public distribution, notarization and
 are separate work. The build helper isolates known stale Command Line Tools interfaces inside
 `.build/` when necessary; it never edits the installed toolchain.
 
-Use the small repository menu at the bottom to switch repositories. Selection and theme are saved
-in the app's preferences. The top-right menu switches between **Orbital** and **Minimal**, refreshes
-the snapshot, or quits. The app does not start automatically at login.
+The compact panel is 320 × 300 points. Use the top-right hamburger menu to switch repositories,
+choose **Orbital** or **Minimal**, refresh, or quit. The header identifies the selected repository;
+selection and theme are saved in the app's preferences. Long content scrolls inside the compact panel. The app does not start automatically at login.
 
 ## What the scene means
 
@@ -28,7 +28,8 @@ Earth is the launch point; successful work builds the space station. The rocket 
 travel from Earth toward the station as the request moves through preparing, validating and landing.
 The active title remains readable across up to four lines, with elapsed execution time below it.
 
-- **Earth badge:** the number of waiting merge requests, not finished commits. Hover or click Earth
+- **Earth badge:** a nonzero number of waiting merge requests, not finished commits. Zero is hidden,
+  and the badge contains only the number. Hover or click Earth
   to read what remains waiting to launch. One request can contain several Git commits.
 - **Rocket:** the current active request; hover or click it to inspect all in-flight work, including
   concurrent fast-lane requests.

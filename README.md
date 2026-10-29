@@ -186,9 +186,9 @@ For contributors to this project, [AGENTS.md](AGENTS.md) provides the source map
 
 ## Native macOS menu-bar app
 
-The optional SwiftUI app lets you inspect the queue without returning to a terminal. It shows one repository at a time, with a small repository selector at the bottom. The default Orbital theme sends a rocket from Earth toward a space station being built by successful merges. Earth shows the waiting-request count; hover or click Earth for remaining work, the station for retained completions, or a temporary debris field for failures. The active title, stage, elapsed time, and a conservative estimated time to clear the work appear below the scene. A Minimal theme is included; themes and artwork are separate from queue reading.
+The optional SwiftUI app lets you inspect the queue without returning to a terminal. Its compact 320 × 300-point panel shows one repository at a time; the hamburger menu contains the repository chooser. The default Orbital theme sends a rocket from Earth toward a space station being built by successful merges. Earth shows only a nonzero waiting-request number; hover or click Earth for remaining work, the station for retained completions, or a temporary debris field for failures. The active title, stage, elapsed time, and a conservative estimated time to clear the work appear below the scene. A Minimal theme is included; themes and artwork are separate from queue reading.
 
-<img src="docs/images/macos-menu-bar.svg" width="390" alt="Native macOS Merge Queue menu-bar panel with Earth with a waiting count, a curved route toward a space station, active request title and elapsed time, a queue-time estimate, and a bottom repository dropdown.">
+<img src="docs/images/macos-menu-bar.svg" width="320" alt="Native macOS Merge Queue menu-bar panel with Earth with a waiting count, a curved route toward a space station, active request title and elapsed time, a queue-time estimate, and a hamburger menu containing repository selection.">
 
 *Orbital theme illustration with synthetic request names.*
 

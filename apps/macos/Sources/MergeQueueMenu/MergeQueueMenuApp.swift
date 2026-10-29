@@ -44,7 +44,7 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         if args.contains("--inspect-window") {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 500),
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: QueuePanel.panelSize.width, height: QueuePanel.panelSize.height),
                                   styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "Merge Queue — Inspector"
             window.contentView = NSHostingView(rootView: LiveQueuePanel())
@@ -59,7 +59,7 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
             let root = QueuePanel(snapshot: PreviewData.snapshot(scenario), theme: theme,
                 onSelectRepository: { _ in }, onSelectTheme: { _ in }, onRefresh: {},
                 onQuit: { NSApplication.shared.terminate(nil) })
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 540),
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: QueuePanel.panelSize.width, height: QueuePanel.panelSize.height),
                                   styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "Merge Queue Preview — \(scenario)"
             window.contentView = NSHostingView(rootView: root)
@@ -73,15 +73,15 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
         catch { fputs("Cannot create preview directory: \(error)\n", stderr); exit(1) }
         var windows: [(String, NSWindow, NSView)] = []
-        for scenario in ["active", "idle", "queued", "failed", "multiple", "long", "empty", "error", "minimal", "learning", "debris-expired", "dense", "preparing"] {
+        for scenario in ["active", "idle", "queued", "failed", "multiple", "long", "empty", "error", "minimal", "learning", "debris-expired", "dense", "preparing", "long-error"] {
             let view = NSHostingView(rootView: QueuePanel(
                 snapshot: PreviewData.snapshot(scenario == "minimal" ? "active" : scenario),
                 theme: scenario == "minimal" ? .minimal : .orbital, onSelectRepository: { _ in },
                 onSelectTheme: { _ in }, onRefresh: {}, onQuit: {}))
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 390, height: 500),
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: QueuePanel.panelSize.width, height: QueuePanel.panelSize.height),
                                   styleMask: [.borderless], backing: .buffered, defer: false)
             window.contentView = view
-            view.frame = NSRect(x: 0, y: 0, width: 390, height: 500)
+            view.frame = NSRect(x: 0, y: 0, width: QueuePanel.panelSize.width, height: QueuePanel.panelSize.height)
             view.layoutSubtreeIfNeeded()
             windows.append((scenario, window, view))
         }
@@ -114,10 +114,10 @@ enum PreviewData {
                     startedAt: finish.addingTimeInterval(-Double(180 + index * 60)), finishedAt: finish))
             }
         }
-        if ["active", "long", "multiple", "learning", "dense", "preparing"].contains(scenario) {
+        if ["active", "long", "multiple", "learning", "dense", "preparing", "long-error"].contains(scenario) {
             requests.append(RequestRecord(id: "mq-synthetic-active", state: "running",
                 phase: scenario == "preparing" ? "preparing" : "validating",
-                sourceBranch: scenario == "long" ? "codex/a-very-long-request-name-that-should-wrap-without-moving-the-repository-picker" : "codex/station-construction",
+                sourceBranch: ["long", "long-error"].contains(scenario) ? "codex/a-very-long-request-name-that-should-wrap-without-moving-the-repository-picker" : "codex/station-construction",
                 sequence: 4, submittedAt: now.addingTimeInterval(-155), startedAt: now.addingTimeInterval(-92)))
             for index in 0..<(scenario == "dense" ? 25 : 2) {
                 requests.append(RequestRecord(id: "mq-waiting-\(index)", state: "queued",
@@ -140,6 +140,6 @@ enum PreviewData {
         }
         return DashboardSnapshot(repositories: scenario == "empty" ? [] : [repo, second],
             selectedRepositoryID: scenario == "empty" ? nil : repo.id, requests: requests,
-            warning: scenario == "error" ? "Queue data unavailable; showing the last readable snapshot." : nil)
+            warning: ["error", "long-error"].contains(scenario) ? "Queue data unavailable; showing the last readable snapshot." : nil)
     }
 }

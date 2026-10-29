@@ -43,8 +43,10 @@ struct SpaceArtwork: View {
                 InspectionButton(title: "Earth", subtitle: "Waiting to launch", empty: "No requests waiting.", requests: snapshot.waitingRequests, palette: palette, history: false) {
                     ZStack(alignment: .topTrailing) {
                         Earth(palette: palette).frame(width: 72, height: 72)
-                        Text("\(snapshot.waitingRequests.count) waiting").font(.system(size: 11, weight: .bold)).foregroundStyle(palette.background)
-                            .padding(.horizontal, 6).padding(.vertical, 3).background(palette.accent, in: Capsule()).offset(x: 8, y: -3)
+                        if !snapshot.waitingRequests.isEmpty {
+                            Text("\(snapshot.waitingRequests.count)").font(.system(size: 11, weight: .bold)).foregroundStyle(palette.background)
+                                .padding(.horizontal, 6).padding(.vertical, 3).background(palette.accent, in: Capsule()).offset(x: 8, y: -3)
+                        }
                     }
                 }.position(x: w * 0.80, y: h * 0.72)
                 let debris = snapshot.debrisRequests(at: date)
@@ -86,14 +88,13 @@ private struct Station: View {
         ZStack {
             Rectangle().fill(palette.line).frame(width: 100, height: 2)
             ForEach(0..<4) { index in
-                RoundedRectangle(cornerRadius: 2).fill(index < modules ? palette.accent.opacity(0.75) : palette.surface)
+                RoundedRectangle(cornerRadius: 2).fill((index == 0 || index == 3 ? modules >= 4 : modules >= 2) ? palette.accent.opacity(0.75) : palette.surface)
                     .overlay(RoundedRectangle(cornerRadius: 2).stroke(palette.accent.opacity(0.65), lineWidth: 1))
-                    .frame(width: 15, height: 25).offset(x: CGFloat(index < 2 ? index - 3 : index + 1) * 14)
+                    .frame(width: 15, height: 25).offset(x: [-44.0, -26.0, 26.0, 44.0][index])
             }
             RoundedRectangle(cornerRadius: 5).fill(palette.surface).overlay(RoundedRectangle(cornerRadius: 5).stroke(palette.text, lineWidth: 1)).frame(width: 31, height: 24)
             Rectangle().fill(palette.text.opacity(0.8)).frame(width: 3, height: 41)
             Circle().fill(palette.accent).frame(width: 7, height: 7)
-            Text("SPACE STATION").font(.system(size: 8, weight: .semibold)).tracking(0.8).foregroundStyle(palette.muted).offset(y: 30)
         }
     }
 }
