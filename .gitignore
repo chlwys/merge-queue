@@ -4,3 +4,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Native app build products
+apps/macos/.build/
+apps/macos/.swiftpm/

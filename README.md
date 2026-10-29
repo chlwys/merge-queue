@@ -26,6 +26,11 @@ What you get:
 * **An optional MCP server** (`merge-queue-mcp`) that lets agents submit once and receive the outcome as the
   result of a single pending tool call, and lets anyone watch a request or wait for a queue to drain.
 
+## Native macOS app
+
+An optional lightweight menu-bar monitor shows one repository at a time, with interchangeable
+Orbital and Minimal themes. See [apps/macos/README.md](apps/macos/README.md) for building and running it.
+
 ## Requirements
 
 * Python 3.11 or newer and Git. POSIX only (file locks, process groups). Developed and tested on macOS;
