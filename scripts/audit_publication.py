@@ -20,11 +20,17 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-
 ALLOWED_EMAIL_DOMAINS = ("example.invalid", "example.com", "example.org", "example.net")
 PUBLIC_EMAIL_DOMAINS = ("noreply.github.com", "users.noreply.github.com")
 METADATA_EMAILS = {"noreply" + "@anthropic.com"}
-# Exact reviewed asset bytes, not an extension or directory exemption. The capture uses
-# synthetic --render-previews data from 69e22e5 and has nonessential metadata removed.
+# Exact reviewed asset bytes, not an extension or directory exemption. Synthetic native
+# captures have nonessential metadata removed. Keep prior digests for history audits.
 REVIEWED_BINARY_SHA256 = {
     # docs/images/macos-menu-bar.png
     "3f0319e835067b0e2b0bd765e1272d3c40660385432cbdec965a71c8c6710a9a",
+    # docs/images/macos-menu-bar.png (balanced panel)
+    "117a9019c06ddab6f824ca2a0672c81fb08a46758ccf2edbf6d5a0e80ece1ff3",
+    # docs/images/macos-menu-bar-queued.png (balanced panel)
+    "764b52b46d661d8d65414ddef3a633052351ff4054c423da18d1371fa5075c86",
+    # docs/images/macos-menu-bar-debris.png (balanced panel)
+    "3f9029bfaaf5f699b779bfe898109e645be1d3209587e8da6033a25515d0b5b1",
 }
 
 

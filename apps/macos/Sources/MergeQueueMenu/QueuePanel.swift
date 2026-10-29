@@ -2,7 +2,7 @@ import SwiftUI
 import QueueModel
 
 struct QueuePanel: View {
-    static let panelSize = CGSize(width: 320, height: 300)
+    static let panelSize = CGSize(width: 320, height: 276)
     let snapshot: DashboardSnapshot
     let theme: QueueThemeID
     let onSelectRepository: (String) -> Void

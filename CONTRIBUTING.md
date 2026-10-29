@@ -30,8 +30,8 @@ email addresses, and scans history with Gitleaks. The GitHub noreply attribution
 in this repository is intentional. Synthetic addresses must use a reserved example domain.
 The audit prints finding locations and categories, without printing matched values.
 Binary files require separate inspection and fail the text audit unless their exact SHA-256
-is recorded in `scripts/audit_publication.py`. The README screenshot is an inspected native
-capture with synthetic queue data and nonessential metadata removed. Updating it requires
+is recorded in `scripts/audit_publication.py`. The README screenshots are inspected native
+captures with synthetic queue data and nonessential metadata removed. Updating one requires
 inspecting the new image and metadata before recording its digest; altered or unrelated
 binaries still fail in both the worktree and Git history.
 

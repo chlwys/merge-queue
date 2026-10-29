@@ -8,6 +8,13 @@ Use the CLI from a terminal, connect agents through the Model Context Protocol (
 
 [Quick start](#quick-start) · [Use cases](#when-to-use-merge-queue) · [Claude and Codex](#use-with-claude-code-and-codex) · [macOS app](#native-macos-menu-bar-app) · [Documentation](#documentation)
 
+| Active merge | Pending work | Recent failure |
+|---|---|---|
+| <img src="docs/images/macos-menu-bar.png" alt="Merge Queue for macOS showing a rocket carrying an active merge toward the station" width="260"> | <img src="docs/images/macos-menu-bar-queued.png" alt="Merge Queue for macOS showing one request waiting on Earth" width="260"> | <img src="docs/images/macos-menu-bar-debris.png" alt="Merge Queue for macOS showing a recent failure as temporary space debris" width="260"> |
+| Rocket tracks the active merge | Earth counts pending requests | Failures form temporary debris |
+
+Screenshots use synthetic queue data.
+
 ## When to use merge-queue
 
 Parallel work is useful until several contributors try to update the same integration checkout. A branch can pass its own tests and still fail when combined with a change that landed moments earlier. merge-queue prepares an isolated candidate, checks the combined result, and refreshes it if the target moves.
@@ -186,7 +193,7 @@ For contributors to this project, [AGENTS.md](AGENTS.md) provides the source map
 
 ## Native macOS menu-bar app
 
-The optional SwiftUI app lets you inspect the queue without returning to a terminal. Its compact 320 × 300-point panel shows one repository at a time; the hamburger menu contains the repository chooser. The default Orbital theme sends a rocket from Earth toward a space station being built by successful merges. Earth shows only a nonzero waiting-request number; hover or click Earth for remaining work, the station for retained completions, or a temporary debris field for failures. The active title, stage, elapsed time, and a conservative estimated time to clear the work appear below the scene. A Minimal theme is included; themes and artwork are separate from queue reading.
+The optional SwiftUI app lets you inspect the queue without returning to a terminal. Its compact 320 × 276-point panel shows one repository at a time; the hamburger menu contains the repository chooser. The default Orbital theme sends a rocket from Earth toward a space station being built by successful merges. Earth shows only a nonzero waiting-request number; hover or click Earth for remaining work, the station for retained completions, or a temporary debris field for failures. The active title, stage, elapsed time, and a conservative estimated time to clear the work appear below the scene. A Minimal theme is included; themes and artwork are separate from queue reading.
 
 <img src="docs/images/macos-menu-bar.png" width="320" alt="Screenshot of the compact macOS Merge Queue app with a hamburger menu, a symmetric station, a rocket on a curved path from Earth, two pending requests, and active merge timing.">
 

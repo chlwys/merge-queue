@@ -18,7 +18,7 @@ The bundle is ad-hoc signed for local use. Public distribution, notarization and
 are separate work. The build helper isolates known stale Command Line Tools interfaces inside
 `.build/` when necessary; it never edits the installed toolchain.
 
-The compact panel is 320 × 300 points. Use the top-right hamburger menu to switch repositories,
+The compact panel is 320 × 276 points. Use the top-right hamburger menu to switch repositories,
 choose **Orbital** or **Minimal**, refresh, or quit. The header identifies the selected repository;
 selection and theme are saved in the app's preferences. Long content scrolls inside the compact panel. The app does not start automatically at login.
 
