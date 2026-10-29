@@ -57,7 +57,7 @@ between install and use, run `install` again under the new root.
 
 ## Running the runner
 
-The runner dispatches accepted requests to `tq`. `submit` starts one on demand (it exits after 120 idle
+The runner dispatches normal requests to `tq` and recovers detached inline executors. `submit` starts one on demand (it exits after 120 idle
 seconds), so a supervisor is optional but recommended on a busy machine:
 
 ```sh
@@ -101,28 +101,42 @@ receipt reads. A command host yielding a session handle leaves that invocation p
 completion instead of issuing another command or repeated short wrapper waits. An actual timeout or
 interruption stops observation only: reattach the same receipt, never resubmit.
 
-## Manual Git override
+## Direct local Git and remote publication
 
-A person may commit, merge, update refs and push directly. Set the override for one command or a shell
-session:
+Ordinary local commits, fast-forward merges, merge commits, and ref updates need no special variable:
 
 ```sh
-MERGE_QUEUE_MANUAL=1 git commit -m "My changes"
-MERGE_QUEUE_MANUAL=1 git push origin main
+git commit -m "My changes"
+git merge --ff-only topic
 ```
 
-Only the exact value `1` enables it. It bypasses this tool's ref and push gates; Git's own checks and any
-chained hooks still run. It works without a request, even when the queue configuration needs repair. It never
-relaxes a queue publication, and the queue strips the variable from child environments. Hooks cannot tell a
-person from a program: this is an operator escape hatch, not a security boundary. Automation should use the
-queue unless a person authorises a specific bypass, and should not inherit the variable.
+Agents may use an authorized direct workflow and record the reason for bypassing queued validation. The
+hook does not require a queue receipt for local Git and permits recovery with broken queue configuration.
+Direct target updates are refused while a queue publication holds the integration lock; queue publications
+always retain exact receipt, SHA, expiry, and lock checks. Git and chained hooks still run. The deprecated
+`MERGE_QUEUE_MANUAL` flag has no authorization effect and is stripped from queue child environments.
 
-Pushing the target branch is refused unless `MERGE_QUEUE_PUSH_APPROVED=1` (or the override) is set for that
+Pushing the target branch is refused unless `MERGE_QUEUE_PUSH_APPROVED=1` is set for that
 push: publishing to a remote is a separate decision from landing locally.
 
 Avoid editing the integration checkout while a landing runs (check `status` first). For a long manual
 session, let active work finish and stop the runner; afterwards leave a clean checkout on the target branch
 and start it again. Pending requests remain durable and are revalidated against the changed target.
+
+An installed `fast_path` policy automatically routes eligible tiny presentation changes inline. The
+`submit`/`retry` CLI returns after acceptance unless `--wait` is requested, for both lanes.
+The executor runs in a separate process session, so disconnecting an observer leaves
+the same receipt running. Reconnect with `result <id> --wait` or MCP `wait_for_result`, never resubmit to
+recover an unknown outcome. Only configured focused checks run; planner errors enter the normal queue.
+
+### Upgrading to the inline-capable runner
+
+Do not enable fast-path policy while an older runner/helper remains active: older stale cleanup assumes
+exclusive candidate ownership. Drain existing requests with one `wait_for_queue_empty` call (or a single
+`runner --drain` when no runner is active), then stop the owning supervisor/runner with SIGTERM and verify
+its exit. SIGTERM on the runner preserves in-flight `tq` children; draining first avoids mixed-version
+helpers. Upgrade the stable installation, re-run `install` to replace hooks, restart the runner, and only
+then enable fast-path policy. Reconnect any saved receipt; never delete queue state or running jobs.
 
 ## Startup notice (optional)
 
@@ -139,7 +153,7 @@ owner's next session, and `inbox` always works.
 |---|---|
 | `MERGE_QUEUE_STATE_HOME` | state root (absolute) |
 | `MERGE_QUEUE_OWNER`, `CODEX_THREAD_ID` | owner id sources (see above) |
-| `MERGE_QUEUE_MANUAL=1` | manual Git override |
+| `MERGE_QUEUE_MANUAL` | deprecated; grants no local or remote authorization |
 | `MERGE_QUEUE_PUSH_APPROVED=1` | allow pushing the target for that push |
 | `MERGE_QUEUE_NO_AUTORUNNER` | `submit` does not start an on-demand runner |
 | `MERGE_QUEUE_PUBLISH_TIMEOUT` | seconds `git merge --ff-only` may run (default 300) |

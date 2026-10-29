@@ -18,10 +18,14 @@ submit  ->  requests/<id>.json (state=queued, seq=N)  ->  runner  ->  tq run -q 
   processes after a restart and requeues requests whose `tq` or landing process vanished (bounded retries).
   It never schedules and never rewrites a later state.
 * **`tq`** (Block's `agent-task-queue` 0.4.1, an external command) provides the FIFO and mutual exclusion:
-  one queue per repository and target branch, named `merge-<repo-id>-<target>`, with one landing at a time.
+  one queue per repository and target branch, named `merge-<repo-id>-<target>`, with one normal landing at a time.
   The queue only reads the public `tq list --json`; it never edits `tq`'s database or runs `tq clear`.
-* **`land`** is what `tq` runs for one request. It prepares, validates and publishes under the
-  integration lock, then records the outcome.
+* **`land`** prepares and validates a request in its own worktree, then holds the shared integration lock
+  for final readiness checks and publication. Long validation does not hold the publication lock.
+* **Inline fast lane** requests use the same `land` guards and durable receipts with `lane: inline`,
+  without `tq`. Submission starts a detached executor; runner recovery adopts its identity or resumes
+  the same receipt after a crash. Trusted policy classification is repeated for each combined candidate.
+  A fast change can land while a normal request validates; the normal request then refreshes and revalidates.
 
 ## Repository identity and configuration
 
@@ -113,14 +117,14 @@ The integration lock (`locks/integration.lock`) is a safety interlock, not the s
 publication inherits it, so a killed helper can neither overlap its own publication nor be replaced until Git
 has finished. The `reference-transaction` hook has two jobs:
 
-* Any transaction that touches the target, outside a publication, is refused unless an unexpired
-  authorisation for exactly that `old -> new` fast-forward exists *and* the lock is held. `MERGE_QUEUE_MANUAL=1`
-  bypasses this for a person (never for a queue publication).
+* Ordinary local transactions touching the target are allowed while the publication lock is free. During
+  publication they are refused, including commands carrying the deprecated `MERGE_QUEUE_MANUAL` variable.
+  Git can stage changes before the ref hook runs; this does not serialize arbitrary checkout writes.
 * Every ref transaction of a publication (`MERGE_QUEUE_PUBLICATION` set) must keep the checkout's symbolic
   `HEAD` on the target and may move only the target, from the authorised old to the authorised new SHA.
   A checkout switched to another branch mid-publication is refused before Git touches the working tree.
 
-A `pre-push` hook refuses pushes of the target unless `MERGE_QUEUE_PUSH_APPROVED=1` or the manual override is
+A `pre-push` hook refuses pushes of the target unless `MERGE_QUEUE_PUSH_APPROVED=1` is
 set: publishing to a remote is a separate decision from landing locally. Pre-existing hooks are chained
 (`<hook>.merge-queue-chained`) and restored by `uninstall`.
 

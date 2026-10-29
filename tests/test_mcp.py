@@ -76,6 +76,62 @@ class MCPIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.is_error, str(result))
         return result.structured_content
 
+    def inline_fixture(self):
+        planner = self.fx.root / "trusted-fast-plan.py"
+        planner.write_text('import json\nprint(json.dumps(dict(eligible=True, reason="fixture presentation")))\n')
+        policy = json.loads(self.fx.policy_path.read_text())
+        policy["checks"]["presentation"] = {"argv": [sys.executable, "-c", "pass"]}
+        policy["fast_path"] = {"plan": [sys.executable, str(planner)], "checks": ["presentation"]}
+        self.fx.set_policy(policy)
+        return self.fx.agent("inline", {"docs/style.css": "body { color: blue; }\n"})
+
+    async def test_inline_submit_uses_real_stdio_without_tq(self):
+        wt, sha = self.inline_fixture()
+        async with self.client() as client:
+            done = self.data(await client.call_tool("submit", self.args(wt, "inline")))
+            self.assertEqual((done["state"], done["lane"], done["exit_code"]), ("landed", "inline", 0))
+            self.assertEqual(done["result"]["landed_sha"], sha)
+            duplicate = self.data(await client.call_tool("submit", self.args(wt, "inline")))
+            self.assertEqual(duplicate["request_id"], "inline")
+        self.assertEqual(self.fx.tq_events(), [])
+        self.assertEqual(self.fx.req("inline")["attempts"], 1)
+
+    async def test_inline_submit_disconnect_reconnects_same_durable_receipt(self):
+        fx = self.fx
+        wt, _ = self.inline_fixture()
+        gate = fx.root / "inline-pause"
+        async with self.client(MERGE_QUEUE_FAULT=f"after_validate:wait={gate}:1") as client:
+            task = asyncio.create_task(client.call_tool("submit", self.args(wt, "inline-disconnect")))
+            await asyncio.to_thread(fx.wait_for, lambda: Path(str(gate) + ".reached").exists(), 20,
+                                    "inline executor validation")
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        gate.touch()
+        async with self.client() as reconnect:
+            done = self.data(await reconnect.call_tool("wait_for_result", self.args(wt, "inline-disconnect")))
+            self.assertEqual((done["state"], done["lane"]), ("landed", "inline"))
+        self.assertEqual(fx.req("inline-disconnect")["attempts"], 1)
+        self.assertEqual(fx.tq_events(), [])
+
+    async def test_inline_submit_timeout_only_stops_observation(self):
+        fx = self.fx
+        wt, _ = self.inline_fixture()
+        gate = fx.root / "inline-timeout"
+        async with self.client(MERGE_QUEUE_FAULT=f"after_validate:wait={gate}:1") as client:
+            args = self.args(wt, "inline-timeout")
+            args["timeout_seconds"] = .2
+            pending = self.data(await client.call_tool("submit", args))
+            self.assertEqual((pending["terminal"], pending["timed_out"], pending["exit_code"]), (False, True, 30))
+            await asyncio.to_thread(fx.wait_for, lambda: Path(str(gate) + ".reached").exists(), 20,
+                                    "inline executor paused after observer timeout")
+            self.assertEqual(fx.req("inline-timeout")["phase"], "validating")
+            gate.touch()
+            done = self.data(await client.call_tool("wait_for_result", self.args(wt, "inline-timeout")))
+            self.assertEqual(done["state"], "landed")
+        self.assertEqual(fx.req("inline-timeout")["attempts"], 1)
+        self.assertEqual(fx.tq_events(), [])
+
     async def test_protocol_success_one_call_and_meaningful_progress(self):
         fx = self.fx
         wt, sha = fx.agent("success", {"a.py": "A = 1\n"})

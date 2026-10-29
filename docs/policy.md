@@ -22,7 +22,7 @@ switch: a contributor cannot choose, shorten or weaken the gate.
 }
 ```
 
-Other top-level keys (for example `comment`) are ignored. See
+Optional `fast_path` is described below. Other top-level keys (for example `comment`) are ignored. See
 [`examples/policy.example.json`](../examples/policy.example.json).
 
 ### Rules: routing changed paths to checks
@@ -55,7 +55,7 @@ POSIX paths.
 
 Substitutions in `argv`, `plan` and every `bootstrap` command are applied with Python `str.format`:
 `{target}` (the target tip the candidate was built on), `{candidate}` (the candidate commit) and
-`{worktree}` (the candidate worktree path). A literal brace must be doubled (`{{`, `}}`). A first
+`{worktree}` (the candidate worktree path), and `{checkout}` (the trusted integration checkout). A literal brace must be doubled (`{{`, `}}`). A first
 element that contains a `/` and is not absolute is resolved against the check's `cwd`; a bare command name
 is looked up on `PATH`.
 
@@ -116,6 +116,37 @@ Example (`web` check in the example policy):
 ```
 
 with a planner that prints `{"checks": ["node"], "unknown": []}` for a front-end-only change.
+
+## Automatic inline fast path
+
+An operator may add a conservative presentation classifier and focused checks:
+
+```json
+"fast_path": {
+  "plan": ["node", "scripts/merge-queue-fast-path.mjs", "--base", "{target}", "--head", "{candidate}"],
+  "checks": ["presentation"],
+  "timeout": 30
+}
+```
+
+`checks` names existing check specifications. The planner runs from the **integration checkout**, never
+from candidate code. Its final line starting with `{` must contain a JSON object with a boolean
+`eligible` and a string `reason`; extra details are retained on the receipt. Timeout defaults to 30 seconds
+and must be greater than zero and at most 120 seconds. Use `{checkout}` in focused check commands to invoke
+trusted tooling while checking the isolated candidate. There is no contributor opt-in or skip flag.
+
+Submission classifies source changes relative to the merge base with the current target. Eligible requests
+run inline, with a durable receipt and no `tq` task or FIFO wait; only the listed focused checks run, without
+the normal broad suites. After preparing/rebasing, the trusted planner classifies the actual net diff from
+the target to the combined candidate again. Every target refresh repeats classification and focused checks.
+Unknown path routing still blocks. Missing/ineligible/failing classification falls back to the normal queue
+with its reason recorded; a failed focused check never publishes. The policy and directly referenced trusted
+command files are fingerprinted across validation; changed authority falls back to normal validation.
+
+Keep the classifier small, deterministic, and conservative: sensitive or ambiguous changes must return
+`eligible: false`. The tool does not infer which languages or presentation edits are safe for a project.
+Candidate changes to its own classifier cannot weaken the gate: classification uses installed policy and
+the integration checkout's code. Dependency inputs of trusted scripts remain the operator's responsibility.
 
 ## `merge-queue policy check`
 

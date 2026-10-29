@@ -2,7 +2,8 @@
 
 A deterministic, local merge queue for Git repositories. Many people or agents work in their own
 worktrees; the queue lands their committed work on one shared branch (usually `main`) one request at a
-time, in first-come order, after validating the **combined** result. No model is involved on the success
+time, in first-come order, after validating the **combined** result. An optional trusted policy sends tiny
+presentation changes through an inline fast lane, ahead of FIFO validation. No model is involved on the success
 path, and the queue never modifies a contributor's branch or worktree.
 
 ```text
@@ -18,8 +19,10 @@ What you get:
   target branch), with durable request files, crash recovery and no duplicate publication.
 * **Validation of what will actually land**: the candidate is the contributor's commits rebased onto the
   current target tip, checked by a policy file that you own. Unknown paths fail closed.
-* **A Git `reference-transaction` guard**: nothing but the queue may move the target branch (an explicit
-  manual override exists for people).
+* **Local Git remains available**: ordinary commits and merges need no special environment variable.
+  The `reference-transaction` guard protects active queue publication and binds its exact receipt and SHAs.
+* **An optional automatic fast lane**: trusted classification and focused checks in an isolated candidate,
+  with the same durable receipt, cleanliness and stale-target guards, without a `tq` task or full suites.
 * **An optional MCP server** (`merge-queue-mcp`) that lets agents submit once and receive the outcome as the
   result of a single pending tool call, and lets anyone watch a request or wait for a queue to drain.
 
@@ -82,13 +85,14 @@ example under launchd or systemd; see the operations guide).
 
 ## Safety model
 
-* The target branch moves only by `git merge --ff-only` of a candidate that was validated against the exact
+* Queue publications move the target only by `git merge --ff-only` of a candidate that was validated against the exact
   tip it extends, with fresh checks of the integration checkout (branch, clean tracked files, no clashing
   untracked or ignored paths) immediately before publication.
 * The Git hook binds every ref transaction of a publication to that publication (authorised old and new
-  SHAs, held integration lock, expiry). Direct updates of the target are refused unless
-  `MERGE_QUEUE_MANUAL=1`. That override is an operator escape hatch, not a security boundary: a hook cannot
-  tell a person from a program running as the same user.
+  SHAs, held integration lock, expiry). Ordinary local target updates are allowed when no queue publication
+  holds the lock. Remote target pushes still require `MERGE_QUEUE_PUSH_APPROVED=1`; the deprecated
+  `MERGE_QUEUE_MANUAL` flag grants no push approval. Git may stage a merge before a hook refusal; this guard
+  does not serialize arbitrary checkout writes. Inspect the checkout after any rejected merge.
 * Policy is read from the integration checkout, never from a candidate, so a change cannot weaken its own
   gate.
 * Process groups are signalled only after pid, start time and argv are verified; nothing is ever deleted
@@ -101,7 +105,7 @@ example under launchd or systemd; see the operations guide).
 | [docs/architecture.md](docs/architecture.md) | Request lifecycle, state layout, locks, publication, recovery, exit codes |
 | [docs/policy.md](docs/policy.md) | Policy file, path routing, the partial-testing planner protocol, `policy check` |
 | [docs/mcp.md](docs/mcp.md) | The global MCP server: tools, events, client setup |
-| [docs/operations.md](docs/operations.md) | Install, state root, registry, runner supervision, manual override, rollback |
+| [docs/operations.md](docs/operations.md) | Install, state root, registry, runner supervision, direct Git, rollback |
 
 ## Development
 

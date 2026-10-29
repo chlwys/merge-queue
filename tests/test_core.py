@@ -550,34 +550,21 @@ class LogEvidenceRetention(QueueCase):
 
 
 class GitEnforcement(QueueCase):
-    def test_direct_updates_of_main_are_refused_but_other_branches_are_not(self):
+    def test_direct_local_updates_are_allowed_without_manual_environment(self):
         fx = self.fx
         wt, sha = fx.agent("x", {"x.py": "X = 1\n"})
-        before = fx.main()
-        denied = [
-            fx.git("commit", "--allow-empty", "-q", "-m", "direct", check=False),
-            fx.git("update-ref", "refs/heads/main", sha, check=False),
-            fx.git("branch", "-f", "main", sha, cwd=wt, check=False),
-            fx.git("merge", "--ff-only", "agent/x", check=False),
-            fx.git("push", "-q", ".", "agent/x:main", cwd=wt, check=False),
-        ]
-        for result in denied:
-            self.assertNotEqual(result.returncode, 0)
-        self.assertIn("integration queue", denied[0].stderr)
-        self.assertEqual(fx.main(), before)
-        # Apple Git stages a fast-forward into the checkout BEFORE the ref transaction is refused, so the
-        # refused direct merge leaves the primary dirty. Nothing in the queue repairs that: it is the
-        # operator's checkout. The refusal says so and the queue fails closed (next test).
-        self.assertIn("nothing resets it automatically", denied[3].stderr)
-        self.assertEqual(fx.git("status", "--porcelain").stdout, "A  x.py\n")
+        fx.git("merge", "--ff-only", "agent/x")
+        self.assertEqual(fx.main(), sha)
+        fx.git("commit", "--allow-empty", "-q", "-m", "direct")
+        self.assertEqual(fx.git("status", "--porcelain").stdout, "")
         fx.write(wt, "y.py", "Y = 1\n")
         fx.git("add", "y.py", cwd=wt)
         self.assertEqual(fx.git("commit", "-q", "-m", "more", cwd=wt, check=False).returncode, 0)
         self.assertEqual(fx.git("branch", "other", sha).returncode, 0)
 
-    def test_manual_override_allows_commits_fast_forward_and_merge_commits(self):
+    def test_direct_commits_fast_forward_and_merge_commits(self):
         fx = self.fx
-        manual = dict(fx.env, MERGE_QUEUE_MANUAL="1")
+        manual = fx.env
         fx.write(fx.primary, "manual.py", "VALUE = 1\n")
         fx.git("add", "manual.py")
         fx.git("commit", "-q", "-m", "manual commit", env=manual)
@@ -591,18 +578,22 @@ class GitEnforcement(QueueCase):
         self.assertEqual(len(parents), 3)
         self.assertEqual(parents[-1], second)
         self.assertEqual(fx.git("status", "--porcelain").stdout, "")
-        # The opt-in does not persist: subsequent plain Git commands are guarded again.
+        # Deprecated manual variables are irrelevant to ordinary local Git.
         for value in (None, "0", "true"):
             env = fx.env if value is None else dict(fx.env, MERGE_QUEUE_MANUAL=value)
-            self.assertNotEqual(fx.git("commit", "--allow-empty", "-q", "-m", "denied",
+            self.assertEqual(fx.git("commit", "--allow-empty", "-q", "-m", "direct",
                                        env=env, check=False).returncode, 0)
 
-    def test_manual_override_allows_push_but_preserves_chained_hooks(self):
+    def test_manual_flag_does_not_approve_push_and_chained_hooks_still_apply(self):
         fx = self.fx
         manual = dict(fx.env, MERGE_QUEUE_MANUAL="1")
         remote = fx.root / "remote.git"
         fx.git("init", "-q", "--bare", str(remote), cwd=fx.root)
-        fx.git("push", "-q", str(remote), "main", env=manual)
+        denied = fx.git("push", "-q", str(remote), "main", env=manual, check=False)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("MERGE_QUEUE_PUSH_APPROVED", denied.stderr)
+        approved = dict(fx.env, MERGE_QUEUE_PUSH_APPROVED="1")
+        fx.git("push", "-q", str(remote), "main", env=approved)
         self.assertEqual(fx.git("rev-parse", "main", cwd=remote).stdout.strip(), fx.main())
         hooks = fx.primary / ".git" / "hooks"
         for name in ("pre-push", "reference-transaction"):
@@ -614,7 +605,7 @@ class GitEnforcement(QueueCase):
               "--checkout", str(fx.primary), "--allow-unstable-paths", check=True)
         for args in (("commit", "--allow-empty", "-q", "-m", "manual"),
                      ("push", "-q", str(remote), "main")):
-            result = fx.git(*args, env=manual, check=False)
+            result = fx.git(*args, env=approved, check=False)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("chained-refusal", result.stderr)
 
@@ -630,13 +621,15 @@ class GitEnforcement(QueueCase):
             self.assertNotIn("MERGE_QUEUE_MANUAL", mq.base_env())
             self.assertNotIn("MERGE_QUEUE_MANUAL", mq.clean_env())
 
-    def test_manual_override_can_recover_with_missing_queue_configuration(self):
+    def test_direct_git_can_recover_with_missing_queue_configuration(self):
         fx = self.fx
         fx.git("config", "--local", "--remove-section", "mergequeue")
-        manual = dict(fx.env, MERGE_QUEUE_MANUAL="1")
-        fx.git("commit", "--allow-empty", "-q", "-m", "recover", env=manual)
-        self.assertNotEqual(fx.git("commit", "--allow-empty", "-q", "-m", "guarded",
-                                   check=False).returncode, 0)
+        fx.git("commit", "--allow-empty", "-q", "-m", "recover")
+        mq = load_module()
+        lock = mq.FileLock(fx.state / "locks" / "integration.lock")
+        with lock:
+            self.assertNotEqual(fx.git("commit", "--allow-empty", "-q", "-m", "busy",
+                                       check=False).returncode, 0)
 
     def test_existing_hooks_are_chained_and_restored_on_uninstall(self):
         def pre_install(fx):
@@ -654,7 +647,7 @@ class GitEnforcement(QueueCase):
         chain.write_text("")
         fx.git("commit", "--allow-empty", "-q", "-m", "direct", check=False)
         self.assertIn("prepared", chain.read_text())
-        self.assertNotEqual(fx.git("commit", "--allow-empty", "-q", "-m", "direct", check=False).returncode, 0)
+        self.assertEqual(fx.git("commit", "--allow-empty", "-q", "-m", "direct", check=False).returncode, 0)
         uninstall = fx.mq("uninstall", check=True)
         hook = fx.primary / ".git" / "hooks" / "reference-transaction"
         self.assertEqual(hook.read_text(), fx.original_hook)
@@ -683,7 +676,8 @@ class SafetyRegressions(QueueCase):
         x_wt, _ = fx.agent("x", {"x.py": "X = 1\n"})
         y_wt, _ = fx.agent("y", {"y.py": "Y = 1\n"})
         before = fx.main()
-        self.assertNotEqual(fx.git("merge", "--ff-only", "agent/x", check=False).returncode, 0)
+        with load_module().FileLock(fx.state / "locks" / "integration.lock"):
+            self.assertNotEqual(fx.git("merge", "--ff-only", "agent/x", check=False).returncode, 0)
         fx.write(fx.primary, "concurrent.txt", "someone else is editing here\n")
         status = fx.git("status", "--porcelain").stdout
         self.assertIn("A  x.py", status)
@@ -819,14 +813,15 @@ class SafetyRegressions(QueueCase):
         same = fx.mq(*base, "--allow-unstable-paths")
         self.assertEqual(same.returncode, 0, same.stderr)
 
-    def test_stale_authorisation_cannot_move_the_target_without_a_lock_holding_publisher(self):
+    def test_direct_transaction_cannot_borrow_an_authorisation_during_publication(self):
         fx = self.fx
         wt, sha = fx.agent("x", {"x.py": "X = 1\n"})
         before = fx.main()
         (fx.state / "auth").mkdir(parents=True)
         (fx.state / "auth" / "forged.json").write_text(json.dumps(
             {"ref": "refs/heads/main", "old": before, "new": sha, "created": time.time()}))
-        denied = fx.git("update-ref", "refs/heads/main", sha, check=False)
+        with load_module().FileLock(fx.state / "locks" / "integration.lock"):
+            denied = fx.git("update-ref", "refs/heads/main", sha, check=False)
         self.assertNotEqual(denied.returncode, 0)
         self.assertEqual(fx.main(), before)
 

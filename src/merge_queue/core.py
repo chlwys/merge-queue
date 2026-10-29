@@ -74,6 +74,10 @@ class TargetMoved(Exception):
     pass
 
 
+class NormalQueue(Exception):
+    """An inline candidate no longer qualifies; retain its receipt and enter FIFO."""
+
+
 class CheckoutWait(Exception):
     """The integration checkout is not ready yet (pre-publication): wait without penalty, bounded."""
 
@@ -484,6 +488,11 @@ def create_request(ctx: Ctx, *, rid, owner, sha, branch, started_at=None, retry_
                "created_at": created or submitted, "submitted_at": submitted, "queue": ctx.queue,
                "not_before": None, "tq": None, "candidate": None, "publication": None, "validation": [],
                "timings": {}, "result": {}, "retry_of": retry_of}
+        target = rev_parse(ctx, ctx.target)
+        routing_base = git("merge-base", target, sha, cwd=ctx.checkout).stdout.strip()
+        decision = classify_fast_path(ctx, rid, routing_base, sha)
+        req.update(lane="inline" if decision["eligible"] else "normal", fast_path=decision,
+                   inline_owner=proc_identity(os.getpid()) if decision["eligible"] else None)
         git("update-ref", source_ref(rid), sha, cwd=ctx.checkout)
         write_json(req_path(ctx, rid), req)
     event(ctx, "submitted", rid, owner=owner, source=sha, seq=seq)
@@ -604,6 +613,9 @@ def brief(req: dict) -> dict:
     keys = ("request_id", "owner_id", "state", "phase", "source_commit_sha", "target_sha", "source_branch",
             "target_branch", "attempt_id", "attempts", "created_at", "submitted_at", "seq")
     out = {k: req.get(k) for k in keys}
+    if req.get("lane"):
+        out["lane"] = req["lane"]
+        out["fast_path"] = {k: v for k, v in req.get("fast_path", {}).items() if k != "log"}
     if req.get("result"):
         out["result"] = req["result"]
     if req.get("superseded_by"):
@@ -635,7 +647,7 @@ def cmd_submit(args):
         f"mq-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
     req, created = create_request(ctx, rid=rid, owner=current_owner(args, cwd), sha=sha, branch=branch,
                                   started_at=args.started_at)
-    ensure_runner(ctx)
+    req = start_submission(ctx, req, created)
     if args.wait:
         req = wait_terminal(ctx, req["request_id"], args.timeout)
     show(req, args, {"duplicate": True} if not created else None)
@@ -672,11 +684,21 @@ def cmd_retry(args):
     with contextlib.suppress(FileNotFoundError):
         (owner_dir(ctx, old["owner_id"]) / f"{old['request_id']}.json").unlink()
     ref_delete(ctx, source_ref(old["request_id"]))
-    ensure_runner(ctx)
+    req = start_submission(ctx, req, created)
     if args.wait:
         req = wait_terminal(ctx, req["request_id"], args.timeout)
     show(req, args)
     return outcome_code(req) if args.wait else 0
+
+
+def start_submission(ctx: Ctx, req: dict, created: bool) -> dict:
+    if created and req.get("lane") == "inline":
+        # A child survives a disconnected CLI/MCP observer. The durable owner identity prevents a runner
+        # from dispatching beside it; the per-request lock is the final duplicate-publication guard.
+        spawn_inline(ctx, req)
+        req = load_req(ctx, req["request_id"])
+    ensure_runner(ctx)
+    return req
 
 
 def latest_for_owner(ctx: Ctx, owners: list[str]):
@@ -886,10 +908,71 @@ def load_policy(path: Path) -> dict:
             assert isinstance(spec["argv"], list) and spec["argv"]
             assert spec.get("plan") is None or (isinstance(spec["plan"], list) and spec["plan"])
             assert all(isinstance(v, list) and v for v in spec.get("bootstrap", {}).values())
+        if "fast_path" in policy:
+            fast = policy["fast_path"]
+            assert isinstance(fast["plan"], list) and fast["plan"] and all(isinstance(a, str) for a in fast["plan"])
+            assert isinstance(fast["checks"], list) and all(c in policy["checks"] for c in fast["checks"])
+            assert isinstance(fast.get("timeout", 30), (int, float)) and 0 < fast.get("timeout", 30) <= 120
     except (OSError, ValueError, KeyError, AssertionError, TypeError) as exc:
         raise Fail("blocked", "policy_invalid", "operator", f"validation policy {path} is unreadable or invalid: {exc!r}",
                    action="Operator: fix the validation policy, then `merge-queue retry <id>`.")
     return policy
+
+
+def classify_fast_path(ctx: Ctx, rid: str, target: str, candidate: str,
+                       attempt_file: Path | None = None) -> dict:
+    """Only the trusted integration policy/planner may shorten a gate. Errors enter the normal queue."""
+    decision = {"eligible": False, "reason": "fast path is not configured", "target": target, "candidate": candidate}
+    temporary = attempt_file is None
+    attempt_file = attempt_file or ctx.p("routing", f"{rid}.json")
+    log = ctx.p("evidence", rid, f"fast-plan-{uuid.uuid4().hex[:8]}.log")
+    try:
+        policy = load_policy(ctx.policy)
+        fast = policy.get("fast_path")
+        if fast is None:
+            return decision
+        subst = {"target": target, "candidate": candidate, "checkout": str(ctx.checkout)}
+        argv = [a.format(**subst) for a in fast["plan"]]
+        if "/" in argv[0] and not os.path.isabs(argv[0]):
+            argv[0] = str(ctx.checkout / argv[0])
+        code = run_group(argv, ctx.checkout, clean_env(), log, fast.get("timeout", 30), attempt_file)
+        if code != 0:
+            raise ValueError(f"planner exited {code}")
+        planned = json.loads([line for line in log.read_text().splitlines() if line.startswith("{")][-1])
+        if type(planned.get("eligible")) is not bool or not isinstance(planned.get("reason"), str):
+            raise ValueError("planner requires boolean eligible and string reason")
+        decision.update(planned, target=target, candidate=candidate, checks=list(fast["checks"]))
+    except (Fail, OSError, ValueError, IndexError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        decision.update(eligible=False, reason=f"fast planner unavailable; normal queue: {exc}")
+    finally:
+        if temporary:
+            attempt_file.unlink(missing_ok=True)
+    if log.exists():
+        decision["log"] = str(log)
+    return decision
+
+
+def fast_authority(ctx: Ctx) -> str:
+    """Fingerprint the policy and integration-owned command files used by its fast gate."""
+    policy = load_policy(ctx.policy)
+    fast = policy.get("fast_path", {})
+    paths = {ctx.policy}
+    commands = [fast.get("plan", [])]
+    for name in fast.get("checks", []):
+        spec = policy["checks"][name]
+        commands.extend([spec["argv"], spec.get("plan", []), *spec.get("bootstrap", {}).values()])
+    for argv in commands:
+        for arg in argv:
+            path = Path(arg.replace("{checkout}", str(ctx.checkout)))
+            if not path.is_absolute():
+                path = ctx.checkout / path
+            if "{" not in str(path) and path.is_file():
+                paths.add(path)
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def plan_checks(policy: dict, paths: list[str]) -> tuple[list[str], list[str]]:
@@ -1028,9 +1111,13 @@ def sweep_stale(ctx: Ctx) -> int:
     """Called with the integration lock held: no queue publication can be running (the lock is inherited by
     the Git child), so leftovers of dead attempts are ours to clear, but only after identity checks."""
     cleaned = 0
+    live_work = set()
     attempts = ctx.p("attempts")
     for path in attempts.glob("*.json") if attempts.is_dir() else []:
         data = read_json(path) or {}
+        if proc_state(data.get("identity")) == "same":
+            live_work.add(f"{path.stem}-{data.get('attempt')}")
+            continue
         if kill_verified_group(data.get("group")):
             cleaned += 1
         elif data.get("group") and proc_state(data["group"]) == "other":
@@ -1038,7 +1125,8 @@ def sweep_stale(ctx: Ctx) -> int:
         path.unlink(missing_ok=True)
     work = ctx.p("work")
     for path in work.iterdir() if work.is_dir() else []:
-        cleaned += remove_worktree(ctx, path)
+        if path.name not in live_work:
+            cleaned += remove_worktree(ctx, path)
     refs = git("for-each-ref", "--format=%(refname)", "refs/merge-queue/candidate", cwd=ctx.checkout, check=False)
     for ref in refs.stdout.split():
         rid = ref.rsplit("/", 1)[1]
@@ -1180,11 +1268,13 @@ def prepare(ctx: Ctx, req: dict, attempt: str, target: str, state: dict) -> tupl
 
 
 def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candidate: str,
-             deadline: float | None = None) -> None:
+             deadline: float | None = None, selected: list[str] | None = None) -> None:
     rid = req["request_id"]
     policy = load_policy(ctx.policy)
     paths = changed_paths(ctx, target, candidate)
     checks, unknown = plan_checks(policy, paths)
+    if selected is not None:
+        checks = selected
     if unknown:
         raise Fail("blocked", "unknown_scope", "operator",
                    f"{len(unknown)} changed path(s) have no validation policy: {', '.join(unknown[:5])}",
@@ -1193,7 +1283,7 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
     mutate(ctx, rid, lambda r: r.update(phase="validating", plan={"paths": len(paths), "checks": checks, "gate_owner": "merge-queue", "results_reused": False, "details": {}}))
     attempt_file = ctx.p("attempts", f"{rid}.json")
     results = []
-    subst = {"target": target, "candidate": candidate, "worktree": str(work)}
+    subst = {"target": target, "candidate": candidate, "worktree": str(work), "checkout": str(ctx.checkout)}
     def resolve(argv, cwd):
         argv = [a.format(**subst) for a in argv]
         if "/" in argv[0] and not os.path.isabs(argv[0]):
@@ -1364,6 +1454,8 @@ def finish_landed(ctx: Ctx, rid: str, landed: str, note: str) -> None:
                        "finished_at": finished, "logs_retained": False}
         for step in r.get("validation", []):  # successful evidence is pruned below: don't claim files that are gone
             step["log"] = None
+        if r.get("fast_path"):
+            r["fast_path"].pop("log", None)
     req = mutate(ctx, rid, done)
     for ref in (source_ref(rid), candidate_ref(rid)):
         ref_delete(ctx, ref)
@@ -1422,6 +1514,8 @@ def checkout_wait_or_fail(ctx: Ctx, rid: str, f: Fail) -> int:
 
 def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, integration: FileLock) -> None:
     for refresh in range(REFRESH_LIMIT + 1):
+        if integration.fd is None and not integration.acquire():
+            raise Infra("publication lock is busy; retrying later")
         req = load_req(ctx, rid)
         target = rev_parse(ctx, ctx.target)
         pub = req.get("publication")
@@ -1436,6 +1530,9 @@ def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, inte
         if refresh and state.get("deadline") is not None and state["deadline"] - time.monotonic() <= 0:
             raise Infra("land time budget exhausted before a refresh; retrying later")
         check_checkout_ready(ctx, req, target)
+        # Long prepare/validation work is private to this request. Only the final readiness checks and
+        # publication need the shared lock, so an inline change can pass a slow FIFO validator.
+        integration.release()
         mutate(ctx, rid, lambda r: r.update(phase="preparing", target_sha=target))
         t0 = time.monotonic()
         fault("before_prepare", attempts)
@@ -1447,16 +1544,30 @@ def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, inte
         mutate(ctx, rid, lambda r: r.update(candidate={"sha": candidate, "target_sha": target, "mode": mode},
                                             timings={**r["timings"], "prepare_seconds": prep}))
         fault("after_prepare", attempts)
+        selected = None
+        authority = None
+        if req.get("lane") == "inline":
+            authority = fast_authority(ctx)
+            decision = classify_fast_path(ctx, rid, target, candidate, ctx.p("attempts", f"{rid}.json"))
+            mutate(ctx, rid, lambda r: r.update(fast_path=decision))
+            if not decision["eligible"]:
+                raise NormalQueue(decision["reason"])
+            selected = decision["checks"]
         t1 = time.monotonic()
-        validate(ctx, req, attempt, state["work"], target, candidate, state.get("deadline"))
+        validate(ctx, req, attempt, state["work"], target, candidate, state.get("deadline"), selected)
         val = round(time.monotonic() - t1, 3)
         mutate(ctx, rid, lambda r: r.update(timings={**r["timings"], "validation_seconds": val}))
         fault("after_validate", attempts)
+        if not integration.acquire():
+            raise Infra("publication lock is busy after validation; retrying later")
+        if rev_parse(ctx, ctx.target) == target and authority is not None and fast_authority(ctx) != authority:
+            raise NormalQueue("trusted fast-path policy or command files changed during validation")
         try:
             publish(ctx, req, attempt, target, candidate, attempts, integration)
         except TargetMoved:
             event(ctx, "target_moved", rid, expected=target)
             remove_worktree(ctx, state.pop("work", None))
+            integration.release()
             continue
         return finish_landed(ctx, rid, candidate, mode)
     raise Infra("the target moved on every refresh; retrying later")
@@ -1552,6 +1663,10 @@ def cmd_land(args):
         event(ctx, "integration_started", rid, attempt=attempt, number=req["attempts"],
               queue_wait=req["timings"]["queue_wait_seconds"])
         integrate(ctx, rid, attempt, req["attempts"], state, integration)
+    except NormalQueue as exc:
+        mutate(ctx, rid, lambda r: r.update(state="queued", phase=None, lane="normal", inline_owner=None,
+                                            last_failure=str(exc), not_before=None))
+        event(ctx, "fast_path_fallback", rid, reason=str(exc))
     except CheckoutWait as wait:
         code = checkout_wait_or_fail(ctx, rid, wait.fail)
     except Fail as f:
@@ -1590,6 +1705,19 @@ def cmd_land(args):
 
 
 # ---------------------------------------------------------------- runner (thin durability layer)
+
+def spawn_inline(ctx: Ctx, req: dict) -> subprocess.Popen:
+    """A durable inline executor uses no tq task, queue position, or FIFO validation slot."""
+    rid = req["request_id"]
+    log = ctx.p("runner", f"inline-{rid}.log")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "ab") as out:
+        proc = subprocess.Popen([*ctx.entry, "land", "--request-id", rid, "--repo-id", ctx.repo_id],
+                                cwd=str(ctx.checkout), env=clean_env(), stdin=subprocess.DEVNULL,
+                                stdout=out, stderr=out, start_new_session=True)
+    mutate(ctx, rid, lambda r: r.update(inline_owner=proc_identity(proc.pid)) if r["state"] not in TERMINAL else None)
+    return proc
+
 
 def land_signature(ctx: Ctx, rid: str) -> str:
     """The exact argv tail of a landing process for THIS repository: `<entry> land --request-id R --repo-id P`."""
@@ -1743,6 +1871,25 @@ def land_processes(ctx: Ctx, rid: str) -> list[int]:
 
 def tick_request(ctx: Ctx, req: dict, children: dict, killing: dict, gate: dict) -> None:
     rid = req["request_id"]
+    if req.get("lane") == "inline":
+        child = children.get(rid)
+        if (child is not None and child.poll() is None) or proc_state(req.get("inline_owner")) == "same":
+            return
+        # The submitter can die between spawning and recording the detached executor. Its attempt and
+        # per-request lock still prove ownership; never requeue or fail a live executor from stale metadata.
+        attempt = read_json(ctx.p("attempts", f"{rid}.json")) or {}
+        if proc_state(attempt.get("identity")) == "same":
+            return
+        probe = FileLock(ctx.p("locks", f"{rid}.lock"), blocking=False)
+        if not probe.acquire():
+            return
+        probe.release()
+        if req["state"] == "running":
+            requeue_or_fail(ctx, rid, "inline executor vanished")
+            return
+        if req["state"] == "queued" and (req.get("not_before") or 0) <= time.time():
+            children[rid] = spawn_inline(ctx, req)
+        return
     if req["state"] in ("dispatched", "running"):
         tq = req.get("tq") or {}
         child = children.get(rid)
@@ -1889,42 +2036,35 @@ def publication_bound_guard(ctx: Ctx, rid: str, data: str) -> int:
 
 
 def reference_transaction_guard(state: str | None) -> int:
-    """Guard agent updates; an explicit operator override allows ordinary manual Git.
-    Queue publications always retain their exact-SHA, expiry and lock checks."""
+    """Ordinary local Git is allowed; queue publications retain exact receipt and lock checks."""
     data = sys.stdin.read()
     if state != "prepared":
         return 0
-    # Check before loading configuration so a person can also recover a broken installation.
-    # Never relax a queue publication, even when a runner inherited a manual shell environment.
-    if os.environ.get("MERGE_QUEUE_MANUAL") == "1" and not os.environ.get("MERGE_QUEUE_PUBLICATION"):
-        return 0
+    bound = os.environ.get("MERGE_QUEUE_PUBLICATION")
     try:
         ctx = load_ctx(os.getcwd())
     except MqError as exc:
-        print(f"merge-queue: cannot verify target update ({exc}); refusing", file=sys.stderr)
-        return 1
-    if os.environ.get("MERGE_QUEUE_PUBLICATION"):
-        return publication_bound_guard(ctx, os.environ["MERGE_QUEUE_PUBLICATION"], data)
-    for line in data.splitlines():
-        parts = line.split()
-        if len(parts) != 3 or parts[2] != ctx.target:
-            continue
-        old, new = parts[0], parts[1]
-        ok = False
-        auth_dir = ctx.p("auth")
-        for path in auth_dir.glob("*.json") if auth_dir.is_dir() else []:
-            auth = read_json(path) or {}
-            if auth.get("ref") == ctx.target and auth.get("old") == old and auth.get("new") == new \
-                    and time.time() - auth.get("created", 0) < AUTH_TTL and publication_lock_held(ctx):
-                ok = subprocess.run(["git", "--git-dir", str(ctx.common), "merge-base", "--is-ancestor", old, new],
-                                    env=clean_env()).returncode == 0
-        if not ok:
-            print(f"merge-queue: {ctx.target} may only be updated by the integration queue "
-                  f"(submit with `merge-queue submit`); refusing {old[:12]}..{new[:12]}\n"
-                  "merge-queue: for a deliberate manual Git command, set MERGE_QUEUE_MANUAL=1.\n"
-                  "merge-queue: Git may already have staged the new tree in this checkout before the refusal; "
-                  "nothing resets it automatically. Inspect `git status` and recover deliberately.", file=sys.stderr)
+        if bound:
+            print(f"merge-queue: cannot verify publication ({exc}); refusing", file=sys.stderr)
             return 1
+        # The installed hook preserves its state path independently of a broken/deleted Git configuration.
+        fallback = os.environ.get("MERGE_QUEUE_GUARD_STATE")
+        if not fallback:
+            return 0
+        lock = FileLock(Path(fallback) / "locks" / "integration.lock", blocking=False)
+        if lock.acquire():
+            lock.release()
+            return 0
+        print("merge-queue: queue publication is active; retry this local Git command after it finishes", file=sys.stderr)
+        return 1
+    if bound:
+        return publication_bound_guard(ctx, bound, data)
+    if any(len(parts := line.split()) == 3 and parts[2] == ctx.target for line in data.splitlines()) \
+            and publication_lock_held(ctx):
+        print("merge-queue: queue publication is active; retry this local Git command after it finishes. "
+              "Git may have staged changes before this refusal; inspect git status; nothing resets it automatically.",
+              file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1953,6 +2093,7 @@ def session_start_notice() -> int:
 def wrapper_ref_transaction(ctx_vals: dict, chained: bool) -> str:
     target, entry = shlex.quote(ctx_vals["target"]), ctx_vals["entry"]  # entry: an already shell-quoted argv prefix
     hook_dir = shlex.quote(ctx_vals["hook_dir"])
+    guard_state = shlex.quote(ctx_vals["state_dir"])
     chain = ""
     if chained:
         chain = f'if [ -x {hook_dir}/reference-transaction{CHAINED} ]; then\n' \
@@ -1962,7 +2103,7 @@ def wrapper_ref_transaction(ctx_vals: dict, chained: bool) -> str:
     return (f"#!/bin/sh\n{HOOK_MARK} (reference-transaction)\ninput=$(cat)\n{chain}"
             'if [ "$1" = prepared ]; then\n  run=0\n  [ -n "${MERGE_QUEUE_PUBLICATION:-}" ] && run=1\n'
             f'  case "$input" in\n    *" "{target}*) run=1 ;;\n  esac\n  if [ "$run" = 1 ]; then\n'
-            f'    printf \'%s\\n\' "$input" | {entry} hook reference-transaction "$@" || exit $?\n  fi\nfi\nexit 0\n')
+            f'    printf \'%s\\n\' "$input" | MERGE_QUEUE_GUARD_STATE={guard_state} {entry} hook reference-transaction "$@" || exit $?\n  fi\nfi\nexit 0\n')
 
 
 def wrapper_pre_push(ctx_vals: dict) -> str:
@@ -1972,9 +2113,9 @@ def wrapper_pre_push(ctx_vals: dict) -> str:
             f'if [ -x {hook_dir}/pre-push{CHAINED} ]; then\n'
             f'  printf \'%s\\n\' "$input" | {hook_dir}/pre-push{CHAINED} "$@" || exit $?\nfi\n'
             f"if printf '%s\\n' \"$input\" | awk '$3 == \"{target}\" {{f=1}} END {{exit f?0:1}}'; then\n"
-            '  if [ "${MERGE_QUEUE_PUSH_APPROVED:-}" != 1 ] && [ "${MERGE_QUEUE_MANUAL:-}" != 1 ]; then\n'
+            '  if [ "${MERGE_QUEUE_PUSH_APPROVED:-}" != 1 ]; then\n'
             f'    echo "merge-queue: pushing {target} is a separate, explicitly authorised step '
-            '(set MERGE_QUEUE_PUSH_APPROVED=1 or MERGE_QUEUE_MANUAL=1 for that push)" >&2\n    exit 1\n  fi\nfi\nexit 0\n')
+            '(set MERGE_QUEUE_PUSH_APPROVED=1 for that push)" >&2\n    exit 1\n  fi\nfi\nexit 0\n')
 
 
 def hooks_dir(checkout: Path) -> Path:
@@ -2092,7 +2233,7 @@ def cmd_install(args):
             "checkoutWaitLimit": str(args.checkout_wait_limit), "registry": str(registry)}
     values = {"runtimeAllow": args.runtime_allow or []}
     hdir = hooks_dir(checkout)
-    vals = {"target": target, "entry": shlex.join(entry), "hook_dir": str(hdir)}
+    vals = {"target": target, "entry": shlex.join(entry), "hook_dir": str(hdir), "state_dir": str(state)}
     if args.dry_run:
         print(json.dumps({"config": plan, "runtimeAllow": values["runtimeAllow"], "hooks_dir": str(hdir)}, indent=1))
         return 0
@@ -2206,7 +2347,8 @@ def cmd_doctor(args):
     add("runner", runner_alive or not pending, "running" if runner_alive else
         ("not running; work pending (submit/launchd will start it)" if pending else "idle"))
     stuck = [r["request_id"] for r in pending if r["state"] in ("dispatched", "running") and not runner_alive
-             and proc_state((r.get("tq") or {}).get("identity")) != "same"]
+             and proc_state((r.get("tq") or {}).get("identity")) != "same"
+             and proc_state(r.get("inline_owner")) != "same"]
     add("stuck_requests", not stuck, ", ".join(stuck))
     mismatched = [r["request_id"] for r in pending if request_mismatch(ctx, r)]
     add("request_configuration", not mismatched, ", ".join(mismatched))
