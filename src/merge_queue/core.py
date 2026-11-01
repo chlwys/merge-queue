@@ -2003,6 +2003,8 @@ def publication_lock_held(ctx: Ctx) -> bool:
 def cmd_hook(args):
     if args.hook_name == "session-start":
         return session_start_notice()
+    if args.hook_name == "desktop-push":
+        return 0 if github_desktop_push() else 1
     return reference_transaction_guard(args.state)
 
 
@@ -2106,6 +2108,52 @@ def wrapper_ref_transaction(ctx_vals: dict, chained: bool) -> str:
             f'    printf \'%s\\n\' "$input" | MERGE_QUEUE_GUARD_STATE={guard_state} {entry} hook reference-transaction "$@" || exit $?\n  fi\nfi\nexit 0\n')
 
 
+def process_executable_path(pid: int) -> str:
+    """Kernel-reported executable identity on macOS; never argv or process title."""
+    import ctypes
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    libproc.proc_pidpath.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(4096)
+    if libproc.proc_pidpath(pid, buffer, len(buffer)) <= 0:
+        raise OSError("cannot inspect process executable")
+    return os.fsdecode(buffer.value)
+
+
+def github_desktop_push() -> bool:
+    if sys.platform != "darwin" or os.environ.get("MERGE_QUEUE_PUBLICATION"):
+        return False
+    roots = (Path("/Applications"), Path.home() / "Applications")
+    apps = [root / "GitHub Desktop.app" / "Contents" for root in roots]
+    git_paths = {str(app / "Resources/app/git/libexec/git-core") for app in apps}
+    executables = {str(app / "MacOS/GitHub Desktop") for app in apps}
+    if os.environ.get("GIT_EXEC_PATH") not in git_paths:
+        return False
+    pid = os.getppid()
+    seen = set()
+    try:
+        for _ in range(32):
+            if pid <= 1 or pid in seen:
+                return False
+            seen.add(pid)
+            executable = process_executable_path(pid)
+            if executable in executables:
+                # Verify official signed code, including user-writable app locations.
+                requirement = ('=identifier "com.github.GitHubClient" and anchor apple generic '
+                               'and certificate leaf[subject.OU] = "VEKTX9H2N7"')
+                app_bundle = str(Path(executable).parents[2])
+                subprocess.run(["/usr/bin/codesign", "--verify", "--strict", "-R", requirement, app_bundle],
+                               check=True, capture_output=True, timeout=10)
+                return True
+            # Only the kernel's parent PID is read from ps, never command/argv text.
+            result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "ppid="],
+                                    check=True, capture_output=True, text=True, timeout=2)
+            pid = int(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return False
+
+
 def wrapper_pre_push(ctx_vals: dict) -> str:
     target = ctx_vals["target"]
     hook_dir = shlex.quote(ctx_vals["hook_dir"])
@@ -2113,7 +2161,7 @@ def wrapper_pre_push(ctx_vals: dict) -> str:
             f'if [ -x {hook_dir}/pre-push{CHAINED} ]; then\n'
             f'  printf \'%s\\n\' "$input" | {hook_dir}/pre-push{CHAINED} "$@" || exit $?\nfi\n'
             f"if printf '%s\\n' \"$input\" | awk '$3 == \"{target}\" {{f=1}} END {{exit f?0:1}}'; then\n"
-            '  if [ "${MERGE_QUEUE_PUSH_APPROVED:-}" != 1 ]; then\n'
+            f'  if [ "${{MERGE_QUEUE_PUSH_APPROVED:-}}" != 1 ] && ! {ctx_vals["entry"]} hook desktop-push; then\n'
             f'    echo "merge-queue: pushing {target} is a separate, explicitly authorised step '
             '(set MERGE_QUEUE_PUSH_APPROVED=1 for that push)" >&2\n    exit 1\n  fi\nfi\nexit 0\n')
 
@@ -2495,7 +2543,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo-id", help="canonical repository id (binds a dispatch to this repository)")
     p = add("hook", cmd_hook, "internal: Git reference-transaction guard and agent SessionStart notice",
             json_flag=False)
-    p.add_argument("hook_name", choices=["reference-transaction", "session-start"])
+    p.add_argument("hook_name", choices=["reference-transaction", "session-start", "desktop-push"])
     p.add_argument("state", nargs="?")
     return parser
 

@@ -99,7 +99,9 @@ the package. See [MCP setup and tool details](mcp.md).
 ## Local and remote push approval
 
 Queue landing is a local integration-checkout fast-forward governed by the installed policy and Git gates.
-Remote pushes are separate: they require `MERGE_QUEUE_PUSH_APPROVED=1`. MCP registration, an agent request,
+Remote agent and CLI pushes are separate: they require `MERGE_QUEUE_PUSH_APPROVED=1`.
+Human GitHub Desktop pushes need no launch variable; the hook checks bundled Git and real process
+ancestry and the official GitHub code signature. Agents must not impersonate Desktop or drive it to evade publication approval. MCP registration, an agent request,
 and queue success do not grant remote push approval. The deprecated `MERGE_QUEUE_MANUAL` variable does not
 authorize a push.
 

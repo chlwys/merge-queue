@@ -221,7 +221,7 @@ See the [macOS app guide](apps/macos/README.md) for state-root configuration, th
 - **Fresh publication checks:** guarded local fast-forwards check branch, tracked cleanliness, unrecognized untracked files, and path overlap with runtime data. The queue never resets your integration checkout to manufacture cleanliness.
 - **Durable recovery:** receipts, acceptance intents, and process identities support reconnect and bounded crash recovery. Failures return evidence to the owner or operator.
 - **Coordinated local Git:** ordinary commits and merges remain possible while no queue publication holds the integration lock. The hooks are same-user coordination guards, not a security sandbox for untrusted contributors.
-- **Separate remote publication:** target pushes require explicit approval via `MERGE_QUEUE_PUSH_APPROVED=1`. Local queue success does not authorize publishing code remotely.
+- **Separate remote publication:** agent and CLI target pushes require explicit approval via `MERGE_QUEUE_PUSH_APPROVED=1`. Human GitHub Desktop pushes need no special launch environment. Local queue success does not authorize publishing code remotely.
 - **One local machine:** one integration checkout and configured target per repository installation. There is no distributed runner, multi-host coordination, or guarantee that a closed agent session will be awakened.
 
 Project validation commands execute code from the candidate. Use trusted repositories and policies appropriate to your environment. Details and recovery instructions are in [architecture](docs/architecture.md) and [operations](docs/operations.md).

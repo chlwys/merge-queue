@@ -549,6 +549,43 @@ class LogEvidenceRetention(QueueCase):
         self.assertFalse(any(p.exists() for p in evidence))  # after ack it is ordinary optional history
 
 
+class DesktopPushRecognition(unittest.TestCase):
+    def test_kernel_process_ancestry_and_git_identity_are_both_required(self):
+        mq = load_module()
+        suffix = "/GitHub Desktop.app/Contents/Resources/app/git/libexec/git-core"
+        app = "/GitHub Desktop.app/Contents/MacOS/GitHub Desktop"
+        for root in ("/Applications", str(Path.home() / "Applications")):
+            with mock.patch.dict(os.environ, {"GIT_EXEC_PATH": root + suffix,
+                                               "MERGE_QUEUE_PUBLICATION": ""}), \
+                 mock.patch.object(mq.sys, "platform", "darwin"), \
+                 mock.patch.object(mq, "process_executable_path", return_value=root + app), \
+                 mock.patch.object(mq.subprocess, "run", return_value=mock.Mock(stdout="1")):
+                self.assertTrue(mq.github_desktop_push())
+                with mock.patch.object(mq.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "codesign")):
+                    self.assertFalse(mq.github_desktop_push())
+                with mock.patch.dict(os.environ, {"MERGE_QUEUE_PUBLICATION": "receipt"}):
+                    self.assertFalse(mq.github_desktop_push())
+                with mock.patch.dict(os.environ, {"GIT_EXEC_PATH": "/tmp" + suffix}):
+                    self.assertFalse(mq.github_desktop_push())
+                with mock.patch.object(mq, "process_executable_path", return_value="/usr/bin/python3"), \
+                     mock.patch.object(mq.subprocess, "run", return_value=mock.Mock(stdout="1")):
+                    self.assertFalse(mq.github_desktop_push())
+                with mock.patch.object(mq, "process_executable_path", side_effect=OSError("denied")):
+                    self.assertFalse(mq.github_desktop_push())
+                with mock.patch.object(mq, "process_executable_path", side_effect=["/usr/bin/git", root + app]), \
+                     mock.patch.object(mq.subprocess, "run", return_value=mock.Mock(stdout="42")), \
+                     mock.patch.object(mq.os, "getppid", return_value=99):
+                    self.assertTrue(mq.github_desktop_push())
+                with mock.patch.object(mq.sys, "platform", "linux"):
+                    self.assertFalse(mq.github_desktop_push())
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS kernel API")
+    def test_kernel_path_for_current_process_is_an_executable(self):
+        path = load_module().process_executable_path(os.getpid())
+        self.assertTrue(Path(path).is_absolute())
+        self.assertTrue(os.access(path, os.X_OK))
+
+
 class GitEnforcement(QueueCase):
     def test_direct_local_updates_are_allowed_without_manual_environment(self):
         fx = self.fx
@@ -608,6 +645,18 @@ class GitEnforcement(QueueCase):
             result = fx.git(*args, env=approved, check=False)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("chained-refusal", result.stderr)
+
+    def test_desktop_identity_alone_cannot_approve_push(self):
+        fx = self.fx
+        remote = fx.root / "remote.git"
+        fx.git("init", "-q", "--bare", str(remote), cwd=fx.root)
+        env = dict(fx.env, GIT_EXEC_PATH="/Applications/GitHub Desktop.app/Contents/Resources/app/git/libexec/git-core")
+        # Invoke the installed hook directly so Git need not exist at the synthetic path.
+        hook = fx.primary / ".git" / "hooks" / "pre-push"
+        update = "refs/heads/main " + "a" * 40 + " refs/heads/main " + "0" * 40 + "\n"
+        result = subprocess.run([str(hook)], input=update, env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MERGE_QUEUE_PUSH_APPROVED", result.stderr)
 
     def test_manual_override_cannot_relax_queue_publication_and_is_not_inherited(self):
         fx = self.fx

@@ -116,8 +116,13 @@ Direct target updates are refused while a queue publication holds the integratio
 always retain exact receipt, SHA, expiry, and lock checks. Git and chained hooks still run. The deprecated
 `MERGE_QUEUE_MANUAL` flag has no authorization effect and is stripped from queue child environments.
 
-Pushing the target branch is refused unless `MERGE_QUEUE_PUSH_APPROVED=1` is set for that
-push: publishing to a remote is a separate decision from landing locally.
+Agent and CLI target pushes require `MERGE_QUEUE_PUSH_APPROVED=1` for that push: remote publication
+is separate from landing locally. Human GitHub Desktop pushes need no special launch environment.
+The hook requires both its exact bundled `GIT_EXEC_PATH` and the kernel-reported Desktop executable in the
+process ancestry, with the official GitHub code signature, under `/Applications/GitHub Desktop.app` or `~/Applications/GitHub Desktop.app`.
+Missing process access, other install locations, and queue publications retain the explicit gate.
+Chained hooks always apply. Agents must not impersonate Desktop or use it to evade approval.
+After upgrading, rerun `merge-queue install` to refresh existing hooks.
 
 Avoid editing the integration checkout while a landing runs (check `status` first). For a long manual
 session, let active work finish and stop the runner; afterwards leave a clean checkout on the target branch

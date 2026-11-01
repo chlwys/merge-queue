@@ -124,8 +124,10 @@ has finished. The `reference-transaction` hook has two jobs:
   `HEAD` on the target and may move only the target, from the authorised old to the authorised new SHA.
   A checkout switched to another branch mid-publication is refused before Git touches the working tree.
 
-A `pre-push` hook refuses pushes of the target unless `MERGE_QUEUE_PUSH_APPROVED=1` is
-set: publishing to a remote is a separate decision from landing locally. Pre-existing hooks are chained
+A `pre-push` hook refuses agent and CLI pushes of the target unless `MERGE_QUEUE_PUSH_APPROVED=1` is
+set: remote publication is separate from landing locally. Human GitHub Desktop pushes are recognized
+by both its bundled Git path and kernel-reported Desktop executable in the process ancestry. This macOS
+exception verifies the official GitHub code signature, fails closed on process-inspection errors and never applies to queue publications. Pre-existing hooks are chained
 (`<hook>.merge-queue-chained`) and restored by `uninstall`.
 
 ### Stale `tq` rows
