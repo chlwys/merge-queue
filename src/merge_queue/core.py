@@ -451,7 +451,7 @@ def owner_candidates(args, cwd, extra=()) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def create_request(ctx: Ctx, *, rid, owner, sha, branch, started_at=None, retry_of=None) -> tuple[dict, bool]:
+def create_request(ctx: Ctx, *, rid, owner, sha, branch, started_at=None, retry_of=None, skip_tests=None) -> tuple[dict, bool]:
     """Persist a request unless an equivalent one exists. Returns (request, created)."""
     with FileLock(ctx.p("locks", "submit.lock")):
         existing = load_req(ctx, rid)
@@ -471,7 +471,7 @@ def create_request(ctx: Ctx, *, rid, owner, sha, branch, started_at=None, retry_
             if other["state"] not in FAILED or other["result"].get("failure_class") == "owner":
                 if other["state"] in FAILED:
                     raise MqError(f"commit {sha[:12]} already failed in {other['request_id']} "
-                                  f"({other['state']}); change it and run `merge-queue retry {other['request_id']}`", 4)
+                                  f"({other['state']}); run `merge-queue retry {other['request_id']}`", 4)
                 return other, False
         for tomb in tombstones(ctx):
             if tomb["source_commit_sha"] == sha and tomb["state"] == "landed":
@@ -488,6 +488,8 @@ def create_request(ctx: Ctx, *, rid, owner, sha, branch, started_at=None, retry_
                "created_at": created or submitted, "submitted_at": submitted, "queue": ctx.queue,
                "not_before": None, "tq": None, "candidate": None, "publication": None, "validation": [],
                "timings": {}, "result": {}, "retry_of": retry_of}
+        if skip_tests:
+            req["skip_tests"] = skip_tests
         target = rev_parse(ctx, ctx.target)
         routing_base = git("merge-base", target, sha, cwd=ctx.checkout).stdout.strip()
         decision = classify_fast_path(ctx, rid, routing_base, sha)
@@ -618,6 +620,10 @@ def brief(req: dict) -> dict:
         out["fast_path"] = {k: v for k, v in req.get("fast_path", {}).items() if k != "log"}
     if req.get("result"):
         out["result"] = req["result"]
+    if req.get("skip_tests"):
+        out["skip_tests"] = req["skip_tests"]
+    if req.get("plan"):
+        out["plan"] = req["plan"]
     if req.get("superseded_by"):
         out["superseded_by"] = req["superseded_by"]
     return out
@@ -667,9 +673,11 @@ def cmd_retry(args):
         if other.get("retry_of") == old["request_id"] and other["source_commit_sha"] == sha:
             show(other, args, {"duplicate": True})
             return 0
-    if old["result"].get("failure_class") == "owner" and sha == old["source_commit_sha"]:
-        raise MqError("no change since the failed submission: repair and commit first; identical commits are "
-                      "not retried", 4)
+    skip_tests = None
+    if args.skip_tests:
+        if sha != old["source_commit_sha"]:
+            raise MqError("--skip-tests requires the unchanged source commit from the failed receipt", 4)
+        skip_tests = {"request_id": old["request_id"], "source_commit_sha": sha}
     rid = valid_id(args.new_request_id, "request id") if args.new_request_id else \
         f"mq-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
     bound = [x for x in (*all_requests(ctx), *tombstones(ctx)) if x["request_id"] == rid]
@@ -680,7 +688,7 @@ def cmd_retry(args):
         mutate(ctx, old["request_id"], lambda r: r.update(state="superseded", phase=None, superseded_by=rid)
                if r["state"] in FAILED else None, allow_terminal_change=True)
     req, created = create_request(ctx, rid=rid, owner=old["owner_id"], sha=sha, branch=branch,
-                                  started_at=old["created_at"], retry_of=old["request_id"])
+                                  started_at=old["created_at"], retry_of=old["request_id"], skip_tests=skip_tests)
     with contextlib.suppress(FileNotFoundError):
         (owner_dir(ctx, old["owner_id"]) / f"{old['request_id']}.json").unlink()
     ref_delete(ctx, source_ref(old["request_id"]))
@@ -1281,6 +1289,14 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
                    files=unknown[:50], action="Operator: add the scope to the validation policy (unknown scopes "
                                               "fail closed), then `merge-queue retry <id>`.")
     mutate(ctx, rid, lambda r: r.update(phase="validating", plan={"paths": len(paths), "checks": checks, "gate_owner": "merge-queue", "results_reused": False, "details": {}}))
+    skip = req.get("skip_tests")
+    if skip:
+        if req["source_commit_sha"] != skip["source_commit_sha"]:
+            raise Fail("blocked", "skip_tests_stale", "owner", "skip-tests source commit changed",
+                       action="Retry without --skip-tests to run validation.")
+        mutate(ctx, rid, lambda r: r["plan"].update(tests_skipped=True, skipped_from=skip["request_id"]))
+        event(ctx, "tests_skipped", rid, source_request=skip["request_id"], target=target)
+        return
     attempt_file = ctx.p("attempts", f"{rid}.json")
     results = []
     subst = {"target": target, "candidate": candidate, "worktree": str(work), "checkout": str(ctx.checkout)}
@@ -1314,8 +1330,9 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
             raise Fail("validation_failed", "validation_failed", "owner",
                        f"{name} failed with exit {code} on the combined candidate {candidate[:12]}",
                        logs=[str(log)], summary=tail(log),
-                       action="Fix the failing checks in your worktree (the log shows the combined candidate), "
-                              "run them locally, commit, then `merge-queue retry <request_id>`.")
+                       action="Inspect the failing checks (the log shows the combined candidate), repair and "
+                              "commit if needed, then `merge-queue retry <request_id>`. For unchanged source, "
+                              "the owner may choose --skip-tests when retesting is unnecessary.")
         head = git("rev-parse", "HEAD", cwd=work).stdout.strip()
         if head != candidate or git("status", "--porcelain", "--untracked-files=no", cwd=work).stdout.strip():
             raise Fail("blocked", "candidate_mutated", "operator",
@@ -2483,9 +2500,11 @@ def build_parser() -> argparse.ArgumentParser:
     source_args(p)
     p.add_argument("--request-id", help="caller-chosen idempotency key")
     p.add_argument("--started-at", help="when the agent started the task (ISO; informational)")
-    p = add("retry", cmd_retry, "resubmit after repairing a failed request")
+    p = add("retry", cmd_retry, "retry a failed request, with or without a new commit")
     p.add_argument("request_id")
     p.add_argument("--new-request-id")
+    p.add_argument("--skip-tests", action="store_true",
+                   help="owner chooses to skip validation checks; requires unchanged source commit")
     source_args(p)
     p = add("result", cmd_result, "show the outcome of a request (default: this owner's latest)")
     p.add_argument("request_id", nargs="?")

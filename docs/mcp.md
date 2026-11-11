@@ -42,7 +42,7 @@ worktree root.
 | Tool | Contract |
 |---|---|
 | `submit(worktree, owner_id, request_id, timeout_seconds=7200)` | Save a new durable `request_id` before calling. Accepts the exact committed `HEAD` of the worktree once, then stays pending until the request is terminal. |
-| `retry(worktree, owner_id, request_id, new_request_id, timeout_seconds=7200)` | After repair and commit, retries your failed receipt once under a new saved ID, then stays pending. |
+| `retry(worktree, owner_id, request_id, new_request_id, timeout_seconds=7200, skip_tests=false)` | Retries your failed receipt (including an unchanged commit) under a new saved ID, then stays pending. The owner may set `skip_tests=true` for unchanged source, even if the target moved; the receipt records skipped checks. |
 | `wait_for_result(worktree, owner_id, request_id, timeout_seconds=7200)` | Reattaches an existing receipt after an actual interruption. Never submits. |
 
 `owner_id` is required: the native chat or session id when there is one, otherwise a stable task id. Reuse it

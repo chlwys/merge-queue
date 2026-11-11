@@ -86,7 +86,7 @@ directory of `git`, `uv` or `npm`): a supervisor-run runner does not read your s
 | Command | Use |
 |---|---|
 | `submit [--wait] [--request-id ID] [--owner ID]` | queue `HEAD` of this worktree (clean, committed); idempotent by id and by exact SHA |
-| `retry <id> [--wait] [--new-request-id ID]` | resubmit after repair; goes to the FIFO tail; an unchanged commit is refused for owner failures |
+| `retry <id> [--wait] [--new-request-id ID] [--skip-tests]` | retry a failed receipt, including an unchanged commit; goes to the FIFO tail; `--skip-tests` is an explicit owner choice and requires unchanged source (the target may change) |
 | `status`, `result [id] [--wait]` | diagnostics or one blocking fallback wait, never a polling loop |
 | `inbox [--quiet]`, `ack <id>\|--all` | failure notices (conflict files, log paths, required action); `ack` keeps only a tombstone |
 | `logs [--level off\|basic\|debug] [-n N]`, `logs-clear` | optional diagnostics; never removes requests, inbox entries or failure evidence |

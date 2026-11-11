@@ -79,14 +79,16 @@ def intent_path(ctx, request_id):
     return ctx.p("mcp-receipts", f"{request_id}.json")
 
 
-def reserve(ctx, request_id, owner_id, path, sha, operation, retry_of=None):
+def reserve(ctx, request_id, owner_id, path, sha, operation, retry_of=None, skip_tests=False):
     """Immutable acceptance intent precedes CLI launch, including lost-response windows."""
     intended = dict(request_id=request_id, owner_id=owner_id, worktree=str(path),
                     source_commit_sha=sha, operation=operation, retry_of=retry_of)
+    if operation == "retry":
+        intended["skip_tests"] = skip_tests
     with core.FileLock(ctx.p("locks", f"mcp-{request_id}.lock")):
         previous = core.read_json(intent_path(ctx, request_id))
         if previous:
-            if any(previous.get(key) != value for key, value in intended.items()):
+            if any(previous.get(key, False if key == "skip_tests" else None) != value for key, value in intended.items()):
                 raise ValueError("request_id is already bound to another acceptance intent")
             return False
         else:
@@ -95,6 +97,8 @@ def reserve(ctx, request_id, owner_id, path, sha, operation, retry_of=None):
                 raise ValueError("request_id is already bound to another queue receipt")
             if direct and operation == "retry" and direct.get("retry_of") != retry_of:
                 raise ValueError("new_request_id is already bound to an unrelated queue receipt")
+            if direct and operation == "retry" and bool(direct.get("skip_tests")) != skip_tests:
+                raise ValueError("new_request_id is already bound to another skip-tests choice")
             core.write_json(intent_path(ctx, request_id), intended)
             return True
 
@@ -418,10 +422,12 @@ def make_server(allow_repos: list[str] | None = None) -> FastMCP:
 
     @server.tool()
     async def retry(worktree: str, owner_id: str, request_id: str, new_request_id: str,
-                    ctx: Context, timeout_seconds: float = 7200) -> dict:
-        """After repair and commit, retry a failed receipt once and await completion.
+                    ctx: Context, timeout_seconds: float = 7200, skip_tests: bool = False) -> dict:
+        """Retry a failed receipt, including an unchanged commit, and await completion.
 
         Supply and save a new durable idempotency key; retry never changes the source worktree.
+        Set skip_tests only when the owner decides validation checks are unnecessary and the source
+        commit is unchanged. The target base may have moved; conflicts and publication guards still apply.
         A disconnected retry is reattached with wait_for_result(new_request_id), not resubmitted.
         """
         path, queue = await context(worktree, owner_id, request_id, timeout_seconds)
@@ -433,11 +439,13 @@ def make_server(allow_repos: list[str] | None = None) -> FastMCP:
             raise ValueError("cannot retry another owner's canonical queue receipt")
         sha, branch = await asyncio.to_thread(core.resolve_source,
             SimpleNamespace(commit=None, branch=None), queue, path)
-        fresh = await asyncio.to_thread(reserve, queue, new_request_id, owner_id, path, sha, "retry", old["request_id"])
+        fresh = await asyncio.to_thread(reserve, queue, new_request_id, owner_id, path, sha, "retry", old["request_id"], skip_tests)
         if not fresh:
             return await await_result(queue, new_request_id, owner_id, timeout_seconds, ctx)
         argv = ["retry", old["request_id"], "--owner", owner_id,
                 "--new-request-id", new_request_id, "--commit", sha]
+        if skip_tests:
+            argv += ["--skip-tests"]
         if branch:
             argv += ["--branch", branch]
         await cli(queue, path, argv, new_request_id)

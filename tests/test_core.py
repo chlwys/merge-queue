@@ -107,8 +107,12 @@ class FifoAndOutcomes(QueueCase):
         self.assertEqual(fx.mq("result", "req-b", cwd=b_wt).returncode, 10)
         self.assertEqual(fx.subjects(), ["c", "a", "base"])  # slot was free for c
         self.assertEqual(fx.git("worktree", "list").stdout.count("\n"), 4)
-        # An unchanged commit is not retried and not resubmitted.
-        self.assertEqual(fx.mq("retry", "req-b", cwd=b_wt).returncode, 4)
+        # An unchanged conflict may be retried, but skipping tests does not skip prepare/conflict checks.
+        retry_result, retry_data = fx.mqj("retry", "req-b", "--new-request-id", "req-b-skip",
+                                          "--skip-tests", "--wait", cwd=b_wt)
+        self.assertNotEqual(retry_result.returncode, 0)
+        self.assertEqual(retry_data["state"], "conflict")
+        self.assertEqual(fx.req("req-b-skip")["validation"], [])
         self.assertEqual(fx.mq("submit", cwd=b_wt).returncode, 4)
         # The owner repairs in its own worktree and resubmits.
         rebase = fx.git("rebase", "main", cwd=b_wt, check=False)
@@ -116,14 +120,14 @@ class FifoAndOutcomes(QueueCase):
         fx.write(b_wt, "shared.py", "TITLE = 'alpha+beta'\n")
         fx.git("add", "shared.py", cwd=b_wt)
         fx.git("-c", "core.editor=true", "rebase", "--continue", cwd=b_wt)
-        result, data = fx.mqj("retry", "req-b", "--wait", cwd=b_wt)
+        result, data = fx.mqj("retry", "req-b-skip", "--wait", cwd=b_wt)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(data["state"], "landed")
         new_id = data["request_id"]
         self.assertGreater(fx.req(new_id)["seq"], fx.req("req-c")["seq"])  # back of the FIFO
         self.assertEqual((fx.primary / "shared.py").read_text(), "TITLE = 'alpha+beta'\n")
         self.assertEqual(fx.inbox("wt-b"), [])
-        again, dup = fx.mqj("retry", "req-b", cwd=b_wt)
+        again, dup = fx.mqj("retry", "req-b-skip", cwd=b_wt)
         self.assertEqual(dup["request_id"], new_id)  # idempotent
         self.assertEqual(fx.mq("ack", "--all", cwd=b_wt).returncode, 0)
         self.assertIsNone(fx.req("req-b"))
@@ -152,6 +156,87 @@ class FifoAndOutcomes(QueueCase):
         self.assertEqual(states["req-two"]["validation"][-1]["exit"], 1)
         self.assertEqual(fx.worktrees().count(str(fx.primary)), 1)
         self.assertFalse(any((fx.state / "work").iterdir()))
+
+    def test_same_commit_retry_can_skip_tests_when_source_and_base_are_unchanged(self):
+        fx = self.fx
+        bad_wt, source_sha = fx.agent("bad", {"lib.py": "def value():\n    return 2\n"})
+        fx.start_runner()
+        fx.submit(bad_wt, "req-bad")
+        failed = fx.wait_states(["req-bad"])["req-bad"]
+        self.assertEqual(failed["state"], "validation_failed")
+        log_paths = failed["result"]["log_paths"]
+        self.assertTrue(log_paths and all(Path(path).exists() for path in log_paths))
+
+        normal_result, normal = fx.mqj("retry", "req-bad", "--new-request-id", "req-normal",
+                                       "--wait", cwd=bad_wt)
+        self.assertNotEqual(normal_result.returncode, 0)
+        self.assertEqual(normal["state"], "validation_failed")
+
+        result, skipped = fx.mqj("retry", "req-normal", "--new-request-id", "req-skip",
+                                 "--skip-tests", "--wait", cwd=bad_wt)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(skipped["state"], "landed")
+        self.assertEqual(skipped["source_commit_sha"], source_sha)
+        retry = fx.req("req-skip")
+        self.assertEqual(retry["skip_tests"], {"request_id": "req-normal",
+                                               "source_commit_sha": source_sha})
+        self.assertEqual(retry["plan"]["tests_skipped"], True)
+        self.assertEqual(retry["plan"]["skipped_from"], "req-normal")
+        self.assertEqual(retry["validation"], [])
+        self.assertTrue(all(Path(path).exists() for path in log_paths))
+        again, duplicate = fx.mqj("retry", "req-normal", "--new-request-id", "req-skip",
+                                  "--skip-tests", cwd=bad_wt)
+        self.assertEqual(duplicate["request_id"], "req-skip")
+
+    def test_skip_tests_allows_source_unchanged_after_target_moves(self):
+        fx = self.fx
+        bad_wt, _ = fx.agent("bad", {"lib.py": "def value():\n    return 2\n"})
+        other_wt, _ = fx.agent("other", {"other.py": "OTHER = True\n"})
+        fx.start_runner()
+        fx.submit(bad_wt, "req-bad")
+        failed = fx.wait_states(["req-bad"])["req-bad"]
+        self.assertEqual(failed["state"], "validation_failed")
+        fx.submit(other_wt, "req-other")
+        self.assertEqual(fx.wait_states(["req-other"])["req-other"]["state"], "landed")
+
+        retry_result, retried = fx.mqj("retry", "req-bad", "--new-request-id", "req-moved",
+                                       "--skip-tests", "--wait", cwd=bad_wt)
+        self.assertEqual(retry_result.returncode, 0, retry_result.stdout + retry_result.stderr)
+        self.assertEqual(retried["state"], "landed")
+        self.assertNotEqual(fx.req("req-moved")["target_sha"], failed["target_sha"])
+        self.assertEqual(fx.req("req-moved")["skip_tests"], {"request_id": "req-bad",
+                                                              "source_commit_sha": failed["source_commit_sha"]})
+
+    def test_skip_tests_refuses_if_source_commit_changed(self):
+        fx = self.fx
+        bad_wt, _ = fx.agent("bad", {"lib.py": "def value():\n    return 2\n"})
+        fx.start_runner()
+        fx.submit(bad_wt, "req-bad")
+        self.assertEqual(fx.wait_states(["req-bad"])["req-bad"]["state"], "validation_failed")
+        fx.write(bad_wt, "new.py", "NEW = True\n")
+        fx.git("add", "new.py", cwd=bad_wt)
+        fx.git("commit", "-q", "-m", "changed source", cwd=bad_wt)
+        result = fx.mq("retry", "req-bad", "--new-request-id", "req-changed",
+                       "--skip-tests", cwd=bad_wt)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual(fx.req("req-bad")["state"], "validation_failed")
+        self.assertIsNone(fx.req("req-changed"))
+
+    def test_skip_tests_does_not_skip_conflict_preparation(self):
+        fx = self.fx
+        a_wt, _ = fx.agent("a", {"shared.py": "VALUE = 'a'\n"})
+        b_wt, _ = fx.agent("b", {"shared.py": "VALUE = 'b'\n"})
+        fx.start_runner()
+        fx.submit(a_wt, "req-a")
+        fx.submit(b_wt, "req-b")
+        states = fx.wait_states(["req-a", "req-b"])
+        self.assertEqual(states["req-b"]["state"], "conflict")
+        result, retry = fx.mqj("retry", "req-b", "--new-request-id", "req-b-skip",
+                               "--skip-tests", "--wait", cwd=b_wt)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(retry["state"], "conflict")
+        self.assertEqual(fx.req("req-b-skip")["validation"], [])
+        self.assertNotIn("tests_skipped", retry.get("plan", {}))
 
     def test_d_five_concurrent_submissions_are_serialised_in_order(self):
         fx = self.fx

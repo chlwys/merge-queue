@@ -199,6 +199,29 @@ class MCPIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(refused.is_error)
             self.assertEqual(len(list((fx.state / "requests").glob("*.json"))), 2)
 
+    async def test_retry_can_skip_tests_for_unchanged_source_and_target(self):
+        fx = self.fx
+        wt, sha = fx.agent("bad", {"lib.py": "def value():\n    return 2\n"})
+        fx.start_runner()
+        async with self.client() as client:
+            failed = self.data(await client.call_tool("submit", self.args(wt, "skip-failure")))
+            self.assertEqual(failed["state"], "validation_failed")
+            skipped = self.data(await client.call_tool("retry", self.args(
+                wt, "skip-failure", new_request_id="skip-retry", skip_tests=True)))
+            self.assertEqual((skipped["state"], skipped["source_commit_sha"]), ("landed", sha))
+            retry = fx.req("skip-retry")
+            self.assertEqual(retry["skip_tests"], {"request_id": "skip-failure",
+                                                   "source_commit_sha": sha})
+            self.assertEqual(retry["plan"]["tests_skipped"], True)
+            self.assertEqual(retry["plan"]["skipped_from"], "skip-failure")
+            self.assertEqual(retry["validation"], [])
+            duplicate = self.data(await client.call_tool("retry", self.args(
+                wt, "skip-failure", new_request_id="skip-retry", skip_tests=True)))
+            self.assertEqual(duplicate["request_id"], "skip-retry")
+            refused = await client.call_tool("retry", self.args(
+                wt, "skip-failure", new_request_id="skip-retry", skip_tests=False), raise_on_error=False)
+            self.assertTrue(refused.is_error)
+
     async def test_timeout_then_reattach_does_not_resubmit(self):
         fx = self.fx
         wt, _ = fx.agent("timeout", {"a.py": "A = 1\n"})

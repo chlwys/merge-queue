@@ -36,11 +36,18 @@ Statuses and list commands are diagnostic snapshots, not waiting mechanisms.
 ## Repair and retry
 
 If a request fails, read its result and follow the reported owner or operator action. Repair the source in
-the worktree, run relevant checks, commit the repair, then retry the failed receipt once using a new
+the worktree when needed, run relevant checks, commit any repair, then retry the failed receipt using a new
 `new_request_id` (MCP) or `--new-request-id` (CLI). Retry is a new queue request linked to the failed one;
 it follows the queue's retry rules and ordering. Do not submit the repaired commit as an unrelated request
 or repeat retry to recover a lost response. Reconnect to the retry receipt with `wait_for_result` using the
 new request ID and original stable owner ID.
+
+Retries rerun the configured checks by default, including retries of unchanged commits. When the source
+commit is unchanged, the owner may explicitly choose `skip_tests=true` (MCP) or `--skip-tests` (CLI) if
+retesting is unnecessary. The target base may have moved: candidate preparation, conflict detection,
+policy scope checks and guarded publication still run. The receipt records the owner's skip choice and
+source receipt; skipped checks are not reported as passing or reused results. Changed source commits
+require normal validation. A repeated request ID retains its original skip choice.
 
 ## Connecting clients
 
