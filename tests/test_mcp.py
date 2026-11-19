@@ -81,6 +81,7 @@ class MCPIntegration(unittest.IsolatedAsyncioTestCase):
         planner.write_text('import json\nprint(json.dumps(dict(eligible=True, reason="fixture presentation")))\n')
         policy = json.loads(self.fx.policy_path.read_text())
         policy["checks"]["presentation"] = {"argv": [sys.executable, "-c", "pass"]}
+        policy["rules"].append({"match": ["docs/*.css"], "checks": ["presentation"]})
         policy["fast_path"] = {"plan": [sys.executable, str(planner)], "checks": ["presentation"]}
         self.fx.set_policy(policy)
         return self.fx.agent("inline", {"docs/style.css": "body { color: blue; }\n"})

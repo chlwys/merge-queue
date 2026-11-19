@@ -10,12 +10,55 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixture import Fixture, MQ_CMD, UNIT_POLICY, load_module
 
 
+class NoCheckInline(unittest.TestCase):
+    """Changes whose every path is routed to no check land inline; the policy has no `fast_path` section."""
+
+    def setUp(self):
+        self.fx = Fixture()
+        self.addCleanup(self.fx.close)
+
+    def test_docs_only_submit_lands_inline_without_tq(self):
+        fx = self.fx
+        wt, sha = fx.agent("docs", {"docs/readme.md": "# notes\n"})
+        result, data = fx.submit(wt, "docs", "--wait")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + fx.debug())
+        req = fx.req("docs")
+        self.assertEqual((data["state"], req["lane"], req["dispatches"], req["tq"]), ("landed", "inline", 0, None))
+        self.assertTrue(req["fast_path"]["eligible"])
+        self.assertEqual(req["fast_path"]["checks"], [])
+        self.assertEqual(req["plan"]["checks"], [])
+        self.assertEqual(fx.main(), sha)
+        self.assertEqual(fx.tq_events(), [])
+
+    def test_mixed_docs_and_code_submit_stays_normal(self):
+        fx = self.fx
+        wt, _ = fx.agent("mixed", {"docs/readme.md": "# notes\n", "extra.py": "X = 1\n"})
+        fx.submit(wt, "mixed")
+        req = fx.req("mixed")
+        self.assertEqual((req["state"], req["lane"]), ("queued", "normal"))
+        self.assertFalse(req["fast_path"]["eligible"])
+
+    def test_unrouted_path_is_not_inline_and_fails_closed(self):
+        fx = self.fx
+        before = fx.main()
+        wt, _ = fx.agent("unrouted", {"other/x.bin": "x\n"})
+        fx.submit(wt, "unrouted")
+        self.assertEqual(fx.req("unrouted")["lane"], "normal")
+        self.assertFalse(fx.req("unrouted")["fast_path"]["eligible"])
+        fx.start_runner()
+        req = fx.wait_states(["unrouted"])["unrouted"]
+        self.assertEqual((req["state"], req["result"]["failure_type"]), ("blocked", "unknown_scope"), fx.debug())
+        self.assertEqual(fx.main(), before)
+
+
 class FastPath(unittest.TestCase):
     def setUp(self):
         self.fx = Fixture()
         self.addCleanup(self.fx.close)
         self.policy = copy.deepcopy(UNIT_POLICY)
         self.policy["checks"]["presentation"] = {"argv": [sys.executable, "-c", "pass"], "timeout": 10}
+        # `docs/*` selects no check, which would take the no-check inline route; stylesheets keep a focused check.
+        self.policy["rules"].append({"match": ["docs/*.css"], "checks": ["presentation"]})
         self.policy["fast_path"] = {"plan": [sys.executable, "{checkout}/fast-plan.py", "{target}", "{candidate}"],
                                     "checks": ["presentation"], "timeout": 5}
         self.fx.write(self.fx.primary, "fast-plan.py",

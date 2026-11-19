@@ -965,6 +965,12 @@ def classify_fast_path(ctx: Ctx, rid: str, target: str, candidate: str,
     log = ctx.p("evidence", rid, f"fast-plan-{uuid.uuid4().hex[:8]}.log")
     try:
         policy = load_policy(ctx.policy)
+        paths = changed_paths(ctx, target, candidate)
+        if paths:
+            selected, unknown = plan_checks(policy, paths)
+            if not selected and not unknown:  # nothing to validate: no planner and no `fast_path` section needed
+                decision.update(eligible=True, checks=[], reason="no validation check is selected for the changed paths")
+                return decision
         fast = policy.get("fast_path")
         if fast is None:
             return decision

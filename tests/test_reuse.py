@@ -166,6 +166,7 @@ class Reuse(unittest.TestCase):
     def test_inline_lane_records_nothing(self):
         fx = self.fx
         self.policy["checks"]["presentation"] = {"argv": [sys.executable, "-c", "pass"], "timeout": 10}
+        self.policy["rules"].append({"match": ["docs/*.css"], "checks": ["presentation"]})
         self.policy["fast_path"] = {"plan": [sys.executable, "-c", "import json; print(json.dumps(dict(eligible=True, reason='r')))"],
                                     "checks": ["presentation"], "timeout": 5}
         fx.set_policy(self.policy)
@@ -173,6 +174,7 @@ class Reuse(unittest.TestCase):
         fx.submit(wt, "fast", "--wait")
         req = fx.req("fast")
         self.assertEqual((req["state"], req["lane"]), ("landed", "inline"), fx.debug())
+        self.assertEqual(req["plan"]["checks"], ["presentation"])
         self.assertNotIn("validated", req)
         self.assertFalse(req["plan"]["results_reused"])
 
