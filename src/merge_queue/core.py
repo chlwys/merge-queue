@@ -38,6 +38,7 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 AUTH_TTL = 900
 PUBLISH_TIMEOUT = int(os.environ.get("MERGE_QUEUE_PUBLISH_TIMEOUT", "300"))
 REFRESH_LIMIT = 3
+LOCK_WAIT = 60  # seconds a starting landing waits for the integration lock (MERGE_QUEUE_LOCK_WAIT overrides)
 LAND_MARGIN = 120  # seconds kept free below tq's landTimeout
 INFRA_EXIT = {75, 124, 126, 127}
 EXIT_OWNER, EXIT_OPERATOR, EXIT_INFRA, EXIT_PENDING, EXIT_NOT_INSTALLED, EXIT_SUPERSEDED = 10, 11, 20, 30, 3, 12
@@ -68,6 +69,10 @@ class Fail(Exception):
 
 class Infra(Exception):
     """Transient infrastructure problem; the request is requeued with bounded retries."""
+
+
+class Refresh(Infra):
+    """The target moved on every refresh pass: requeue without consuming an attempt (dispatch cap still bounds it)."""
 
 
 class TargetMoved(Exception):
@@ -150,14 +155,26 @@ class FileLock:
     def __init__(self, path: Path, blocking=True):
         self.path, self.blocking, self.fd = path, blocking, None
 
-    def acquire(self) -> bool:
+    def acquire(self, timeout: float | None = None) -> bool:
+        """Take the lock. A non-blocking lock with `timeout` seconds retries in short sleeps until the deadline
+        (a signal handler may raise from the sleep; the descriptor is closed on every exit path)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        deadline = None if self.blocking or not timeout else time.monotonic() + timeout
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | (0 if self.blocking else fcntl.LOCK_NB))
-        except OSError:
-            os.close(fd)
-            return False
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | (0 if self.blocking else fcntl.LOCK_NB))
+                    break
+                except OSError:
+                    if deadline is None or time.monotonic() >= deadline:
+                        os.close(fd)
+                        return False
+                time.sleep(min(0.1, max(deadline - time.monotonic(), 0.005)))
+        except BaseException:  # Terminated or KeyboardInterrupt while waiting: never leak the descriptor
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
         self.fd = fd
         return True
 
@@ -179,7 +196,9 @@ def proc_identity(pid) -> dict | None:
     """Verifiable identity of a live process: pid + start time + argv. None when it is gone."""
     if not pid:
         return None
-    result = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,lstart=,args="], capture_output=True, text=True)
+    # lstart is printed in the caller's locale: pin it so every process records and verifies the same text.
+    result = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,lstart=,args="], capture_output=True, text=True,
+                            env={**os.environ, "LC_ALL": "C"})
     parts = result.stdout.strip().split(None, 6)
     if result.returncode or len(parts) < 7 or parts[0].startswith("Z"):
         return None
@@ -671,8 +690,10 @@ def cmd_retry(args):
     sha, branch = resolve_source(args, ctx, cwd)
     for other in all_requests(ctx):
         if other.get("retry_of") == old["request_id"] and other["source_commit_sha"] == sha:
+            if args.wait:
+                other = wait_terminal(ctx, other["request_id"], args.timeout)
             show(other, args, {"duplicate": True})
-            return 0
+            return outcome_code(other) if args.wait else 0
     skip_tests = None
     if args.skip_tests:
         if sha != old["source_commit_sha"]:
@@ -1529,9 +1550,18 @@ def checkout_wait_or_fail(ctx: Ctx, rid: str, f: Fail) -> int:
     return 75
 
 
+def lock_wait_seconds(state: dict) -> float:
+    """How long a landing may wait for the integration lock: holders are bounded by the publication timeout,
+    and the wait never outlives the remaining land budget."""
+    wait = PUBLISH_TIMEOUT + 30
+    if state.get("deadline") is not None:
+        wait = min(wait, state["deadline"] - time.monotonic())
+    return max(wait, 0)
+
+
 def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, integration: FileLock) -> None:
     for refresh in range(REFRESH_LIMIT + 1):
-        if integration.fd is None and not integration.acquire():
+        if integration.fd is None and not integration.acquire(timeout=lock_wait_seconds(state)):
             raise Infra("publication lock is busy; retrying later")
         req = load_req(ctx, rid)
         target = rev_parse(ctx, ctx.target)
@@ -1575,7 +1605,7 @@ def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, inte
         val = round(time.monotonic() - t1, 3)
         mutate(ctx, rid, lambda r: r.update(timings={**r["timings"], "validation_seconds": val}))
         fault("after_validate", attempts)
-        if not integration.acquire():
+        if not integration.acquire(timeout=lock_wait_seconds(state)):
             raise Infra("publication lock is busy after validation; retrying later")
         if rev_parse(ctx, ctx.target) == target and authority is not None and fast_authority(ctx) != authority:
             raise NormalQueue("trusted fast-path policy or command files changed during validation")
@@ -1587,7 +1617,7 @@ def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, inte
             integration.release()
             continue
         return finish_landed(ctx, rid, candidate, mode)
-    raise Infra("the target moved on every refresh; retrying later")
+    raise Refresh("the target moved on every refresh; retrying later")
 
 
 def record_failure(ctx: Ctx, rid: str, f: Fail) -> None:
@@ -1652,7 +1682,7 @@ def cmd_land(args):
                                              "restore the original configuration or resubmit from the owner."))
         return EXIT_OPERATOR
     integration = FileLock(ctx.p("locks", "integration.lock"), blocking=False)
-    if not integration.acquire():
+    if not integration.acquire(timeout=float(os.environ.get("MERGE_QUEUE_LOCK_WAIT") or LOCK_WAIT)):
         print(f"{rid}: integration lock is held by another process; will be requeued")
         return 75
     signal.signal(signal.SIGTERM, _on_term)
@@ -1689,6 +1719,10 @@ def cmd_land(args):
     except Fail as f:
         record_failure(ctx, rid, f)
         code = EXIT_OPERATOR if f.klass == "operator" else EXIT_OWNER
+    except Refresh as exc:  # contention with other landers is not this request's failure: no attempt consumed
+        mutate(ctx, rid, lambda r: r.update(attempts=max(r["attempts"] - 1, 0)) if r["state"] not in TERMINAL else None)
+        requeue_or_fail(ctx, rid, str(exc)[:500], penalty=False)
+        code = 75
     except (Infra, MqError, subprocess.SubprocessError, OSError) as exc:
         requeue_or_fail(ctx, rid, str(exc)[:500])
         code = 75

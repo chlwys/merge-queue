@@ -1523,6 +1523,174 @@ class RepoAgnostic(QueueCase):
             self.assertNotIn("scripts/", text)
 
 
+class LockWaitsAndFairness(QueueCase):
+    """Short integration-lock contention waits instead of burning attempts; refresh exhaustion is not a failure."""
+
+    def counting_policy(self):
+        marker = self.fx.root / "executions.txt"
+        script = self.fx.root / "count_check.py"
+        script.write_text("import sys\nfrom pathlib import Path\n"
+                          f"with Path({str(marker)!r}).open('a') as f:\n    f.write('run\\n')\n")
+        self.fx.set_policy({**UNIT_POLICY, "checks": {"unit": {"argv": [sys.executable, str(script)], "timeout": 60}}})
+        return marker
+
+    def executions(self, marker):
+        return len(marker.read_text().split()) if marker.exists() else 0
+
+    def test_lock_held_at_land_start_is_waited_for_without_a_requeue(self):
+        import fcntl
+        fx = self.fx
+        marker = self.counting_policy()
+        wt, _ = fx.agent("x", {"x.py": "X = 1\n"})
+        (fx.state / "locks").mkdir(parents=True, exist_ok=True)
+        holder = os.open(fx.state / "locks" / "integration.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            fx.start_runner(MERGE_QUEUE_LOCK_WAIT="30")
+            fx.submit(wt, "req-x")
+            fx.wait_for(lambda: (fx.req("req-x") or {}).get("state") == "dispatched", 30, "the land to be dispatched")
+            time.sleep(1.5)  # the land is now waiting on the lock
+            self.assertEqual(fx.req("req-x")["state"], "dispatched")
+            self.assertEqual(self.executions(marker), 0)
+        finally:
+            os.close(holder)
+        done = fx.wait_states(["req-x"])["req-x"]
+        self.assertEqual(done["state"], "landed", fx.debug())
+        self.assertEqual((done["attempts"], done["dispatches"]), (1, 1), fx.debug())
+        self.assertEqual(self.executions(marker), 1)
+
+    def test_lock_busy_when_validation_finishes_does_not_discard_the_validation(self):
+        import fcntl
+        fx = self.fx
+        marker = self.counting_policy()
+        gate = fx.root / "gate"
+        wt, _ = fx.agent("x", {"x.py": "X = 1\n"})
+        fx.start_runner(MERGE_QUEUE_FAULT=f"after_validate:wait={gate}:1")
+        fx.submit(wt, "req-x")
+        fx.wait_for(lambda: Path(str(gate) + ".reached").exists(), 30, "validation to finish")
+        holder = os.open(fx.state / "locks" / "integration.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            gate.write_text("go")
+            time.sleep(3)  # the landing is waiting for the lock with a finished validation
+            self.assertEqual(fx.req("req-x")["state"], "running")
+            self.assertEqual(self.executions(marker), 1)
+        finally:
+            os.close(holder)
+        done = fx.wait_states(["req-x"])["req-x"]
+        self.assertEqual(done["state"], "landed", fx.debug())
+        self.assertEqual(done["attempts"], 1, fx.debug())
+        self.assertEqual(self.executions(marker), 1)
+
+    def test_bounded_wait_acquire_times_out_and_does_not_leak_the_descriptor(self):
+        mq = load_module()
+        path = self.fx.root / "unit.lock"
+        holder = mq.FileLock(path, blocking=False)
+        self.assertTrue(holder.acquire())
+        try:
+            waiter = mq.FileLock(path, blocking=False)
+            t0 = time.monotonic()
+            self.assertFalse(waiter.acquire(timeout=0.4))
+            self.assertGreaterEqual(time.monotonic() - t0, 0.35)
+            self.assertIsNone(waiter.fd)
+            self.assertFalse(mq.FileLock(path, blocking=False).acquire())  # no timeout: immediate, as before
+            opened = set(os.listdir("/dev/fd"))
+
+            def interrupt(*_):
+                raise mq.Terminated()
+            old = signal.signal(signal.SIGALRM, interrupt)
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0.2)
+                with self.assertRaises(mq.Terminated):
+                    waiter.acquire(timeout=10)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old)
+            self.assertIsNone(waiter.fd)
+            self.assertLessEqual(len(set(os.listdir("/dev/fd")) - opened), 1)  # only listdir's own descriptor
+        finally:
+            holder.release()
+        late = mq.FileLock(path, blocking=False)
+        self.assertTrue(late.acquire(timeout=1))
+        late.release()
+
+    def test_refresh_exhaustion_requeues_without_consuming_an_attempt(self):
+        fx = self.fx
+        fx.set_policy({**UNIT_POLICY, "checks": {"unit": {"argv": [sys.executable, "-c", "pass"], "timeout": 60}}})
+        wt, _ = fx.agent("x", {"x.py": "X = 1\n"})
+        fx.submit(wt, "req-x")
+        driver = ("import sys\nimport merge_queue.core as m\n"
+                  "def moved(*a, **k):\n    raise m.TargetMoved()\n"
+                  "m.publish = moved\n"
+                  "sys.exit(m.main(['land', '--request-id', 'req-x']))\n")
+        for _ in range(2):  # repeated exhaustion keeps the request pending and unpenalised
+            result = subprocess.run([sys.executable, "-P", "-c", driver], cwd=fx.primary, env=fx.env, text=True,
+                                    capture_output=True, timeout=120)
+            self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+            req = fx.req("req-x")
+            self.assertEqual((req["state"], req["attempts"], req["dispatches"]), ("queued", 0, 0), fx.debug())
+            self.assertIn("moved on every refresh", req["last_failure"])
+            time.sleep(0.3)
+
+    def test_retry_wait_on_a_duplicate_waits_and_returns_the_outcome_code(self):
+        fx = self.fx
+        wt, _ = fx.agent("bad", {"lib.py": "def value():\n    return 2\n"})
+        runner = fx.start_runner()
+        fx.submit(wt, "req-bad")
+        self.assertEqual(fx.wait_states(["req-bad"])["req-bad"]["state"], "validation_failed")
+        fx.stop_runner(runner)
+        fx.write(wt, "lib.py", "def value():\n    return 1\n")
+        fx.git("add", "-A", cwd=wt)
+        fx.git("commit", "-q", "-m", "repair", cwd=wt)
+        first = fx.mq("retry", "req-bad", "--new-request-id", "req-fixed", cwd=wt)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        second = subprocess.Popen([*MQ_CMD, "retry", "req-bad", "--wait", "--json"], cwd=wt, env=fx.env, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: second.poll() is None and second.kill())
+        time.sleep(1.5)
+        self.assertIsNone(second.poll(), "a duplicate retry with --wait must wait for the outcome")
+        fx.start_runner()
+        out, err = second.communicate(timeout=90)
+        self.assertEqual(second.returncode, 0, out + err)
+        data = json.loads(out)
+        self.assertEqual(data["state"], "landed")
+        self.assertTrue(data.get("duplicate"))
+
+    def test_retry_wait_on_a_duplicate_returns_a_failure_outcome_code(self):
+        fx = self.fx
+        wt, _ = fx.agent("bad", {"lib.py": "def value():\n    return 2\n"})
+        fx.start_runner()
+        fx.submit(wt, "req-bad")
+        self.assertEqual(fx.wait_states(["req-bad"])["req-bad"]["state"], "validation_failed")
+        fx.write(wt, "lib.py", "def value():\n    return 3\n")
+        fx.git("add", "-A", cwd=wt)
+        fx.git("commit", "-q", "-m", "still-bad", cwd=wt)
+        first = fx.mq("retry", "req-bad", "--new-request-id", "req-again", "--wait", cwd=wt)
+        self.assertEqual(first.returncode, 10, first.stdout + first.stderr)
+        again = fx.mq("retry", "req-bad", "--wait", cwd=wt)
+        self.assertEqual(again.returncode, 10, again.stdout + again.stderr)
+
+
+class ProcessIdentityLocale(unittest.TestCase):
+    def test_identity_recorded_under_another_locale_verifies_under_the_c_locale(self):
+        mq = load_module()
+        child = subprocess.Popen(["sleep", "120"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+
+        def probe(loc):
+            return subprocess.run(["ps", "-p", str(child.pid), "-o", "lstart="], capture_output=True, text=True,
+                                  env={**os.environ, "LC_ALL": loc}).stdout.strip()
+        locale = next((l for l in ("en_GB.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8") if probe(l) != probe("C")), None)
+        if locale is None:
+            self.skipTest("ps prints lstart identically in every available locale")
+        with mock.patch.dict(os.environ, {"LC_ALL": locale}):
+            recorded = mq.proc_identity(child.pid)
+        self.assertIsNotNone(recorded)
+        with mock.patch.dict(os.environ, {"LC_ALL": "C"}):
+            self.assertEqual(mq.proc_state(recorded), "same")
+        self.assertEqual(recorded["start"], " ".join(probe("C").split()))
+
+
 class PolicyUnits(unittest.TestCase):
     def test_overlap_checks_both_directions(self):
         mq = load_module()
