@@ -927,9 +927,10 @@ def cmd_logs_clear(args):
 
 # ---------------------------------------------------------------- policy
 
-def load_policy(path: Path) -> dict:
+def load_policy(path: Path, raw: bytes | None = None) -> dict:
+    """Parse the policy; `raw` lets a caller that fingerprinted the exact bytes parse those same bytes."""
     try:
-        policy = json.loads(path.read_text())
+        policy = json.loads(path.read_text() if raw is None else raw.decode())
         assert policy["version"] == 1 and isinstance(policy["rules"], list) and isinstance(policy["checks"], dict)
         for rule in policy["rules"]:
             assert isinstance(rule["match"], list) and all(c in policy["checks"] for c in rule["checks"])
@@ -937,12 +938,13 @@ def load_policy(path: Path) -> dict:
             assert isinstance(spec["argv"], list) and spec["argv"]
             assert spec.get("plan") is None or (isinstance(spec["plan"], list) and spec["plan"])
             assert all(isinstance(v, list) and v for v in spec.get("bootstrap", {}).values())
+        assert isinstance(policy.get("carry_validation", True), bool)
         if "fast_path" in policy:
             fast = policy["fast_path"]
             assert isinstance(fast["plan"], list) and fast["plan"] and all(isinstance(a, str) for a in fast["plan"])
             assert isinstance(fast["checks"], list) and all(c in policy["checks"] for c in fast["checks"])
             assert isinstance(fast.get("timeout", 30), (int, float)) and 0 < fast.get("timeout", 30) <= 120
-    except (OSError, ValueError, KeyError, AssertionError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, AssertionError, TypeError) as exc:  # ValueError covers bad JSON/UTF-8
         raise Fail("blocked", "policy_invalid", "operator", f"validation policy {path} is unreadable or invalid: {exc!r}",
                    action="Operator: fix the validation policy, then `merge-queue retry <id>`.")
     return policy
@@ -1296,10 +1298,72 @@ def prepare(ctx: Ctx, req: dict, attempt: str, target: str, state: dict) -> tupl
     return work, git("rev-parse", "HEAD", cwd=work).stdout.strip(), "rebased"
 
 
+def policy_bytes(ctx: Ctx) -> tuple[bytes, str]:
+    raw = ctx.policy.read_bytes()
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def validated_record(req: dict) -> dict | None:
+    """The receipt's well-formed `validated` record, or None. Anything malformed is treated as absent."""
+    v = req.get("validated")
+    if isinstance(v, dict) and all(isinstance(v.get(k), str) and v[k] for k in ("target", "candidate", "policy")) \
+            and isinstance(v.get("paths"), list) and isinstance(v.get("checks"), list):
+        return v
+    return None
+
+
+def exact_reuse_ok(ctx: Ctx, req: dict, target: str) -> bool:
+    """True only if this very candidate, on this very target, already passed its whole gate under the same policy.
+    Any doubt or error is False (the normal path then prepares and validates)."""
+    try:
+        v = validated_record(req)
+        rid = req["request_id"]
+        pinned = req.get("candidate") or {}
+        return bool(v and req.get("lane") == "normal" and not req.get("skip_tests")
+                    and v["target"] == target and pinned.get("sha") == v["candidate"] and pinned.get("mode")
+                    and rev_parse(ctx, candidate_ref(rid)) == v["candidate"]
+                    and policy_bytes(ctx)[1] == v["policy"]
+                    and git("merge-base", target, v["candidate"], cwd=ctx.checkout).stdout.strip() == target)
+    except Exception:
+        return False
+
+
+def carry_over(ctx: Ctx, req: dict, target: str, candidate: str) -> dict | None:
+    """After the target moved: which checks of the earlier `validated` record are still sound for the freshly
+    prepared candidate. Returns {"checks", "policy", "target", "candidate"} or None (run everything).
+    Every condition must hold; any doubt or error is None, never a skip."""
+    try:
+        v = validated_record(req)
+        if not v or req.get("lane") != "normal" or req.get("skip_tests") or v["target"] == target:
+            return None
+        raw, digest = policy_bytes(ctx)
+        if digest != v["policy"]:
+            return None
+        policy = load_policy(ctx.policy, raw)
+        if policy.get("carry_validation", True) is not True or not is_ancestor(ctx, v["target"], target):
+            return None
+        if changed_paths(ctx, target, candidate) != v["paths"]:
+            return None
+        planned, planned_unknown = plan_checks(policy, v["paths"])
+        if planned_unknown or planned != v["checks"]:
+            return None
+        intervening, unknown = plan_checks(policy, changed_paths(ctx, v["target"], target))
+        if unknown:
+            return None
+        carried = [name for name in v["checks"] if name not in intervening]
+        if not carried:
+            return None
+        return {"checks": carried, "policy": digest, "target": v["target"], "candidate": v["candidate"]}
+    except Exception:
+        return None
+
+
 def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candidate: str,
-             deadline: float | None = None, selected: list[str] | None = None) -> None:
+             deadline: float | None = None, selected: list[str] | None = None,
+             reuse: dict | None = None) -> None:
     rid = req["request_id"]
-    policy = load_policy(ctx.policy)
+    raw, digest = policy_bytes(ctx)
+    policy = load_policy(ctx.policy, raw)
     paths = changed_paths(ctx, target, candidate)
     checks, unknown = plan_checks(policy, paths)
     if selected is not None:
@@ -1309,8 +1373,16 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
                    f"{len(unknown)} changed path(s) have no validation policy: {', '.join(unknown[:5])}",
                    files=unknown[:50], action="Operator: add the scope to the validation policy (unknown scopes "
                                               "fail closed), then `merge-queue retry <id>`.")
-    mutate(ctx, rid, lambda r: r.update(phase="validating", plan={"paths": len(paths), "checks": checks, "gate_owner": "merge-queue", "results_reused": False, "details": {}}))
     skip = req.get("skip_tests")
+    # Carry only checks that passed under these very policy bytes; skipped or inline gates never carry.
+    carried = []
+    if reuse and not skip and req.get("lane") == "normal" and reuse.get("policy") == digest:
+        carried = [name for name in checks if name in reuse["checks"]]
+    plan = {"paths": len(paths), "checks": checks, "gate_owner": "merge-queue", "results_reused": bool(carried),
+            "reused_checks": carried, "details": {}}
+    if carried:
+        plan["reused_from"] = {"target": reuse["target"], "candidate": reuse["candidate"]}
+    mutate(ctx, rid, lambda r: r.update(phase="validating", plan=plan))
     if skip:
         if req["source_commit_sha"] != skip["source_commit_sha"]:
             raise Fail("blocked", "skip_tests_stale", "owner", "skip-tests source commit changed",
@@ -1318,6 +1390,9 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
         mutate(ctx, rid, lambda r: r["plan"].update(tests_skipped=True, skipped_from=skip["request_id"]))
         event(ctx, "tests_skipped", rid, source_request=skip["request_id"], target=target)
         return
+    if carried:
+        event(ctx, "validation_reused", rid, mode="carried", checks=carried, target=target,
+              from_target=reuse["target"], from_candidate=reuse["candidate"])
     attempt_file = ctx.p("attempts", f"{rid}.json")
     results = []
     subst = {"target": target, "candidate": candidate, "worktree": str(work), "checkout": str(ctx.checkout)}
@@ -1361,7 +1436,7 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
                        action="Operator: validation must not modify tracked files; fix the check.")
         return log
 
-    for name in checks:
+    for name in [c for c in checks if c not in carried]:
         spec = policy["checks"][name]
         cwd = work / spec.get("cwd", ".")
         setup = []
@@ -1385,6 +1460,10 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
         for index, argv in enumerate(setup, 1):
             run_step(name, f"setup{index}", resolve(argv, cwd), cwd, spec, "setup")
         run_step(name, "check", resolve(spec["argv"], cwd), cwd, spec, "check")
+    if req.get("lane") == "normal":  # the inline lane always reclassifies and reruns its own focused checks
+        record = {"target": target, "candidate": candidate, "paths": paths, "checks": checks, "policy": digest,
+                  "at": now()}
+        mutate(ctx, rid, lambda r: r.update(validated=record))
 
 
 def publish(ctx: Ctx, req: dict, attempt: str, target: str, candidate: str, attempts: int,
@@ -1577,6 +1656,23 @@ def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, inte
         if refresh and state.get("deadline") is not None and state["deadline"] - time.monotonic() <= 0:
             raise Infra("land time budget exhausted before a refresh; retrying later")
         check_checkout_ready(ctx, req, target)
+        if exact_reuse_ok(ctx, req, target):
+            # Same target, same pinned candidate, same policy: the earlier gate result is exactly this one.
+            # Publish under the lock we already hold (publish() still does its own fresh checkout/target checks).
+            record = validated_record(req)
+            mode = req["candidate"]["mode"]
+            mutate(ctx, rid, lambda r: (r.update(phase="validating", target_sha=target), r.setdefault("plan", {}).update(
+                results_reused=True, reused_checks=list(record["checks"]),
+                reused_from={"target": record["target"], "candidate": record["candidate"]})))
+            event(ctx, "validation_reused", rid, mode="exact", checks=record["checks"], target=target,
+                  candidate=record["candidate"])
+            try:
+                publish(ctx, req, attempt, target, record["candidate"], attempts, integration)
+            except TargetMoved:
+                event(ctx, "target_moved", rid, expected=target)
+                integration.release()
+                continue
+            return finish_landed(ctx, rid, record["candidate"], mode)
         # Long prepare/validation work is private to this request. Only the final readiness checks and
         # publication need the shared lock, so an inline change can pass a slow FIFO validator.
         integration.release()
@@ -1601,7 +1697,8 @@ def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, inte
                 raise NormalQueue(decision["reason"])
             selected = decision["checks"]
         t1 = time.monotonic()
-        validate(ctx, req, attempt, state["work"], target, candidate, state.get("deadline"), selected)
+        reuse = None if selected is not None else carry_over(ctx, req, target, candidate)
+        validate(ctx, req, attempt, state["work"], target, candidate, state.get("deadline"), selected, reuse)
         val = round(time.monotonic() - t1, 3)
         mutate(ctx, rid, lambda r: r.update(timings={**r["timings"], "validation_seconds": val}))
         fault("after_validate", attempts)
@@ -1630,6 +1727,7 @@ def record_failure(ctx: Ctx, rid: str, f: Fail) -> None:
 
     def fin(r):
         r.update(state=f.state, phase=None)
+        r.pop("validated", None)  # a terminal receipt is never re-dispatched; a retry is a new request
         r["result"] = {"outcome": f.state, "failure_type": f.ftype, "failure_class": f.klass, "message": f.message,
                        "conflicting_files": f.files, "log_paths": f.logs, "required_action": f.action,
                        "finished_at": entry["created_at"]}
@@ -1711,8 +1809,8 @@ def cmd_land(args):
               queue_wait=req["timings"]["queue_wait_seconds"])
         integrate(ctx, rid, attempt, req["attempts"], state, integration)
     except NormalQueue as exc:
-        mutate(ctx, rid, lambda r: r.update(state="queued", phase=None, lane="normal", inline_owner=None,
-                                            last_failure=str(exc), not_before=None))
+        mutate(ctx, rid, lambda r: (r.pop("validated", None), r.update(
+            state="queued", phase=None, lane="normal", inline_owner=None, last_failure=str(exc), not_before=None)))
         event(ctx, "fast_path_fallback", rid, reason=str(exc))
     except CheckoutWait as wait:
         code = checkout_wait_or_fail(ctx, rid, wait.fail)

@@ -93,9 +93,11 @@ class FastPath(unittest.TestCase):
     def test_fast_lane_passes_slow_fifo_validation_then_fifo_refreshes(self):
         fx = self.fx
         gate, reached = fx.root / "release-slow", fx.root / "slow-started"
+        runs = fx.root / "slow-runs"
         slow = fx.root / "slow.py"
         slow.write_text("import pathlib, time\n"
                         f"pathlib.Path({str(reached)!r}).touch()\n"
+                        f"open({str(runs)!r}, 'a').write('x\\n')\n"
                         f"while not pathlib.Path({str(gate)!r}).exists(): time.sleep(.05)\n")
         self.policy["checks"]["unit"]["argv"] = [sys.executable, str(slow)]
         fx.set_policy(self.policy)
@@ -117,6 +119,11 @@ class FastPath(unittest.TestCase):
         self.assertEqual(state["state"], "landed", fx.debug())
         self.assertEqual(state["candidate"]["target_sha"], fx.req("fast")["result"]["landed_sha"])
         self.assertEqual(fx.subjects()[:2], ["normal", "style"])
+        # The intervening fast landing touched only docs/style.css (routed to no check): the slow `unit` result
+        # of the first pass is carried to the refreshed candidate instead of being run again.
+        self.assertEqual(state["plan"]["reused_checks"], ["unit"])
+        self.assertTrue(state["plan"]["results_reused"])
+        self.assertEqual(len(runs.read_text().split()), 1)
 
     def test_stale_source_routes_inline_and_target_move_revalidates(self):
         fx = self.fx
