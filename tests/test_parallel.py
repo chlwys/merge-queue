@@ -24,6 +24,14 @@ marks, name, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 other = sys.argv[4] if len(sys.argv) > 4 else None
 (marks / f"pid-{name}").write_text(str(os.getpid()))
 (marks / f"started-{name}").write_text(str(time.time()))
+if mode == "count":  # record start/end times; each check lives long enough for the others to overlap it
+    def note(kind):
+        with open(marks / "events", "a") as handle:
+            handle.write(f"{time.time():.6f} {kind} {name}\n")
+    note("+")
+    time.sleep(1.5)
+    note("-")
+    sys.exit(0)
 if mode == "loop":
     for _ in range(300):
         time.sleep(0.1)
@@ -80,6 +88,19 @@ class ParallelChecks(unittest.TestCase):
         self.assertTrue(self.mark("finished", "a").exists() and self.mark("finished", "b").exists())
         self.assertEqual(sorted(s["check"] for s in req["validation"]), ["a", "b"])
         self.assertEqual(req["validated"]["checks"], ["a", "b"])
+
+    def test_concurrency_is_bounded_by_the_configured_number(self):
+        self.configure({n: ("count", None) for n in "abc"}, parallel=2)
+        req = self.land()
+        self.assertEqual(req["state"], "landed", self.fx.debug())
+        self.assertEqual(sorted(s["check"] for s in req["validation"]), ["a", "b", "c"])
+        events = sorted(line.split() for line in (self.marks / "events").read_text().splitlines())  # time, +/-, name
+        live = peak = 0
+        for _, kind, _ in events:
+            live += 1 if kind == "+" else -1
+            peak = max(peak, live)
+        self.assertEqual(peak, 2, events)
+        self.assertEqual(sum(kind == "+" for _, kind, _ in events), 3)
 
     def test_without_the_key_checks_run_one_after_the_other(self):
         for top in ({}, {"parallel": 1}):

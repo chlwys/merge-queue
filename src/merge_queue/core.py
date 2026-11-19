@@ -1522,10 +1522,11 @@ def carry_over(ctx: Ctx, req: dict, target: str, candidate: str) -> dict | None:
         return None
 
 
-def run_parallel(names: list[str], chain, cancel: threading.Event) -> None:
-    """Run each check's chain in its own thread; the calling (main) thread only waits, so the SIGTERM handler's
-    `Terminated` lands here and every live group is stopped. The first failing chain stops the others (a chain
-    stopped by us is not a failure); the failure of the earliest check in policy order is re-raised."""
+def run_parallel(names: list[str], chain, cancel: threading.Event, limit: int) -> None:
+    """Run each check's chain in its own thread, at most `limit` at a time, in policy order. The calling (main)
+    thread only waits, so the SIGTERM handler's `Terminated` lands here and every live group is stopped. The first
+    failing chain stops the others (a chain stopped by us is not a failure); the failure of the earliest check in
+    policy order is re-raised."""
     failures: dict[str, BaseException] = {}
     idle = threading.Event()
 
@@ -1539,17 +1540,24 @@ def run_parallel(names: list[str], chain, cancel: threading.Event) -> None:
             cancel.set()
         finally:
             idle.set()
-    threads = [threading.Thread(target=worker, args=(name,)) for name in names]
+    threads: list[threading.Thread] = []
+    queued = list(names)
     try:
-        for thread in threads:
-            thread.start()
-        while any(thread.is_alive() for thread in threads):
-            idle.wait(0.5)
+        while True:
             idle.clear()
+            running = sum(thread.is_alive() for thread in threads)
+            while queued and running < limit and not cancel.is_set():  # never start a chain after a failure
+                thread = threading.Thread(target=worker, args=(queued.pop(0),))
+                threads.append(thread)
+                thread.start()
+                running += 1
+            if not running:
+                break
+            idle.wait(0.5)
     finally:
         cancel.set()  # normal completion, a failure or Terminated: no group may outlive validation
         for thread in threads:
-            if thread.ident is not None:  # started
+            if thread.ident is not None:  # Terminated may land between append and start
                 thread.join()
     for name in names:
         if name in failures:
@@ -1668,7 +1676,7 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
         run_step(name, "check", resolve(spec["argv"], cwd), cwd, spec, "check")
 
     if parallel:
-        run_parallel(todo, chain, cancel)
+        run_parallel(todo, chain, cancel, policy["parallel"])
         last = results[-1]
         verify_unmodified("validation", "run", last["log"])
     else:
