@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -93,6 +94,10 @@ class CheckoutWait(Exception):
 
 class Terminated(BaseException):
     pass
+
+
+class Cancelled(BaseException):
+    """A parallel validation chain was stopped by the coordinator (never a check failure)."""
 
 
 # ---------------------------------------------------------------- basic helpers
@@ -1037,6 +1042,7 @@ def load_policy(path: Path, raw: bytes | None = None) -> dict:
             assert spec.get("plan") is None or (isinstance(spec["plan"], list) and spec["plan"])
             assert all(isinstance(v, list) and v for v in spec.get("bootstrap", {}).values())
         assert isinstance(policy.get("carry_validation", True), bool)
+        assert "parallel" not in policy or (type(policy["parallel"]) is int and policy["parallel"] >= 1)
         if "fast_path" in policy:
             fast = policy["fast_path"]
             assert isinstance(fast["plan"], list) and fast["plan"] and all(isinstance(a, str) for a in fast["plan"])
@@ -1277,10 +1283,11 @@ def sweep_stale(ctx: Ctx, own: str | None = None) -> int:
         if path.stem != own and request_lock_busy(ctx, path.stem):
             live_work.add(f"{path.stem}-{data.get('attempt')}")
             continue
-        if kill_verified_group(data.get("group")):
-            cleaned += 1
-        elif data.get("group") and proc_state(data["group"]) == "other":
-            event(ctx, "stale_pid_ignored", None, pid=data["group"].get("pid"))
+        for group in [data.get("group"), *(data.get("groups") or [])]:  # `groups`: parallel validation chains
+            if kill_verified_group(group):
+                cleaned += 1
+            elif group and proc_state(group) == "other":
+                event(ctx, "stale_pid_ignored", None, pid=group.get("pid"))
         path.unlink(missing_ok=True)
     work = ctx.p("work")
     for path in work.iterdir() if work.is_dir() else []:
@@ -1351,8 +1358,21 @@ def step_env(extra: dict) -> dict:
     return base_env({k: str(v) for k, v in extra.items()})
 
 
-def run_group(argv, cwd, env, log: Path, timeout: int, attempt_file: Path) -> int | None:
-    """Run in its own process group so SIGTERM/timeout can reap every descendant."""
+ATTEMPT_LOCK = threading.Lock()
+
+
+def track_group(attempt_file: Path, identity: dict, live: bool) -> None:
+    """Parallel validation: keep every live group in the attempt file's `groups` list; chain threads serialise here."""
+    with ATTEMPT_LOCK:
+        data = read_json(attempt_file) or {}
+        groups = [g for g in data.get("groups") or [] if g.get("pid") != identity["pid"]]
+        write_json(attempt_file, {**data, "groups": groups + [identity] if live else groups})
+
+
+def run_group(argv, cwd, env, log: Path, timeout: int, attempt_file: Path,
+              cancel: threading.Event | None = None) -> int | None:
+    """Run in its own process group so SIGTERM/timeout can reap every descendant. With a `cancel` event (parallel
+    validation) the group is recorded in the attempt file's `groups` list and `Cancelled` stops it when set."""
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "wb") as out:
         try:
@@ -1361,14 +1381,20 @@ def run_group(argv, cwd, env, log: Path, timeout: int, attempt_file: Path) -> in
         except OSError as exc:
             out.write(f"cannot start {argv[0]}: {exc}\n".encode())
             return 127
-        data = read_json(attempt_file) or {}
-        write_json(attempt_file, {**data, "group": proc_identity(proc.pid) or {"pid": proc.pid}})
+        identity = proc_identity(proc.pid) or {"pid": proc.pid}
+        if cancel is None:
+            data = read_json(attempt_file) or {}
+            write_json(attempt_file, {**data, "group": identity})
+        else:
+            track_group(attempt_file, identity, True)
         try:
             deadline = time.monotonic() + timeout
             while True:
                 try:
                     return proc.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
                     if time.monotonic() > deadline:
                         out.write(f"\n[merge-queue] timeout after {timeout}s\n".encode())
                         kill_group(proc.pid, 5.0, proc)
@@ -1380,7 +1406,10 @@ def run_group(argv, cwd, env, log: Path, timeout: int, attempt_file: Path) -> in
             raise
         finally:
             kill_group(proc.pid, 0.2, proc)
-            write_json(attempt_file, {**data, "group": None})
+            if cancel is None:
+                write_json(attempt_file, {**data, "group": None})
+            else:
+                track_group(attempt_file, identity, False)
 
 
 TAIL_WINDOW = 64 * 1024
@@ -1493,6 +1522,40 @@ def carry_over(ctx: Ctx, req: dict, target: str, candidate: str) -> dict | None:
         return None
 
 
+def run_parallel(names: list[str], chain, cancel: threading.Event) -> None:
+    """Run each check's chain in its own thread; the calling (main) thread only waits, so the SIGTERM handler's
+    `Terminated` lands here and every live group is stopped. The first failing chain stops the others (a chain
+    stopped by us is not a failure); the failure of the earliest check in policy order is re-raised."""
+    failures: dict[str, BaseException] = {}
+    idle = threading.Event()
+
+    def worker(name):
+        try:
+            chain(name)
+        except Cancelled:
+            pass
+        except BaseException as exc:
+            failures[name] = exc
+            cancel.set()
+        finally:
+            idle.set()
+    threads = [threading.Thread(target=worker, args=(name,)) for name in names]
+    try:
+        for thread in threads:
+            thread.start()
+        while any(thread.is_alive() for thread in threads):
+            idle.wait(0.5)
+            idle.clear()
+    finally:
+        cancel.set()  # normal completion, a failure or Terminated: no group may outlive validation
+        for thread in threads:
+            if thread.ident is not None:  # started
+                thread.join()
+    for name in names:
+        if name in failures:
+            raise failures[name]
+
+
 def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candidate: str,
              deadline: float | None = None, selected: list[str] | None = None,
              reuse: dict | None = None) -> None:
@@ -1530,11 +1593,17 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
               from_target=reuse["target"], from_candidate=reuse["candidate"])
     attempt_file = ctx.p("attempts", f"{rid}.json")
     results = []
+    todo = [c for c in checks if c not in carried]
+    parallel = len(todo) > 1 and policy.get("parallel", 1) > 1  # opt-in; otherwise the sequential path below
+    cancel = threading.Event() if parallel else None
+    results_lock = threading.Lock()
     subst = {"target": target, "candidate": candidate, "worktree": str(work), "checkout": str(ctx.checkout)}
     def resolve(argv, cwd):
         return policy_argv(argv, subst, cwd)
 
     def run_step(name, label, argv, cwd, spec, kind):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
         log = ctx.p("evidence", rid, f"{attempt}-{name}-{label}.log")
         started = time.monotonic()
         own = int(spec.get("timeout", 1800))
@@ -1543,11 +1612,12 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
             raise Infra(f"land time budget exhausted before {name} {label}; retrying later")
         limited = remaining is not None and remaining < own
         code = run_group(argv, cwd, step_env(spec.get("env", {})), log, min(own, remaining) if limited else own,
-                         attempt_file)
+                         attempt_file, cancel)
         seconds = round(time.monotonic() - started, 3)
-        results.append({"check": name, "step": label, "exit": code, "seconds": seconds, "log": str(log)})
-        event(ctx, "check", rid, level="debug", check=name, step=label, exit=code, seconds=seconds)
-        mutate(ctx, rid, lambda r: r.update(validation=results))
+        with results_lock:
+            results.append({"check": name, "step": label, "exit": code, "seconds": seconds, "log": str(log)})
+            event(ctx, "check", rid, level="debug", check=name, step=label, exit=code, seconds=seconds)
+            mutate(ctx, rid, lambda r: r.update(validation=results))
         # Setup/plan steps never blame the owner; only the check itself can be an owner failure.
         if code is None and limited:  # cut short by the land budget (not its own timeout): never the owner's fault
             raise Infra(f"land time budget exhausted during {name} {label} (stopped after {round(remaining)}s); "
@@ -1561,14 +1631,18 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
                        action="Inspect the failing checks (the log shows the combined candidate), repair and "
                               "commit if needed, then `merge-queue retry <request_id>`. For unchanged source, "
                               "the owner may choose --skip-tests when retesting is unnecessary.")
+        if not parallel:  # concurrent chains are verified together once they all finished (see below)
+            verify_unmodified(name, label, log)
+        return log
+
+    def verify_unmodified(name, label, log):
         head = git("rev-parse", "HEAD", cwd=work).stdout.strip()
         if head != candidate or git("status", "--porcelain", "--untracked-files=no", cwd=work).stdout.strip():
             raise Fail("blocked", "candidate_mutated", "operator",
                        f"{name} {label} changed tracked files or HEAD in the candidate workspace", logs=[str(log)],
                        action="Operator: validation must not modify tracked files; fix the check.")
-        return log
 
-    for name in [c for c in checks if c not in carried]:
+    def chain(name):
         spec = policy["checks"][name]
         cwd = work / spec.get("cwd", ".")
         setup = []
@@ -1592,6 +1666,14 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
         for index, argv in enumerate(setup, 1):
             run_step(name, f"setup{index}", resolve(argv, cwd), cwd, spec, "setup")
         run_step(name, "check", resolve(spec["argv"], cwd), cwd, spec, "check")
+
+    if parallel:
+        run_parallel(todo, chain, cancel)
+        last = results[-1]
+        verify_unmodified("validation", "run", last["log"])
+    else:
+        for name in todo:
+            chain(name)
     if req.get("lane") == "normal":  # the inline lane always reclassifies and reruns its own focused checks
         record = {"target": target, "candidate": candidate, "paths": paths, "checks": checks, "policy": digest,
                   "at": now()}
@@ -2063,7 +2145,7 @@ def owned_pids(ctx: Ctx) -> set[int]:
     identities = []
     for path in ctx.p("attempts").glob("*.json") if ctx.p("attempts").is_dir() else []:
         data = read_json(path) or {}
-        identities += [data.get("identity"), data.get("group")]
+        identities += [data.get("identity"), data.get("group"), *(data.get("groups") or [])]
     for req in all_requests(ctx):
         identities += [(req.get("publication") or {}).get("git"), (req.get("tq") or {}).get("identity")]
     return {i["pid"] for i in identities if i and i.get("start") and proc_state(i) == "same"}
