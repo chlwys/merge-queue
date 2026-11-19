@@ -404,6 +404,26 @@ class MCPIntegration(unittest.IsolatedAsyncioTestCase):
             # Initial snapshot, registration checkpoint, final timeout snapshot only.
             self.assertEqual(len(snapshots), 3)
 
+    async def test_progress_names_the_checkout_wait_reason(self):
+        queue = core.load_ctx(self.fx.primary)
+        wt, _ = self.fx.agent("wait", {"a.py": "A = 1\n"})
+        self.fx.submit(wt, "waiting", "--owner", "chat-one")
+        reason = "checkout_dirty: integration checkout has tracked changes: lib.py"
+        req = self.fx.req("waiting")
+        req.update(state="queued", checkout_wait_since=core.now(), checkout_wait_reason=reason)
+        core.write_json(queue.p("requests", "waiting.json"), req)
+        reports = []
+
+        class Recorder:
+            async def report_progress(self, *args, **kwargs):
+                reports.append(kwargs.get("message"))
+
+        result = await adapter.await_result(queue, "waiting", "chat-one", 1, Recorder())
+        self.assertFalse(result["terminal"])
+        self.assertEqual(result["checkout_wait_reason"], reason)
+        self.assertTrue(any("waiting for the integration checkout: checkout_dirty" in (m or "") for m in reports),
+                        reports)
+
     # ------------------------------------------------------------------ one global server, many repositories
 
     async def test_one_server_serves_two_repositories_and_lists_both(self):

@@ -645,6 +645,10 @@ def brief(req: dict) -> dict:
         out["plan"] = req["plan"]
     if req.get("superseded_by"):
         out["superseded_by"] = req["superseded_by"]
+    if req.get("state") not in TERMINAL:  # a finished receipt carries its outcome in `result`, not a wait
+        for key in ("checkout_wait_since", "checkout_wait_reason", "last_failure"):
+            if req.get(key):
+                out[key] = req[key]
     return out
 
 
@@ -659,6 +663,8 @@ def show(req: dict, args, extra=None) -> None:
         line += f" {res['failure_type']}: {res.get('message', '')}"
     if res.get("landed_sha"):
         line += f" landed={res['landed_sha'][:12]}"
+    if data.get("checkout_wait_reason"):
+        line += f" waiting={data['checkout_wait_reason']}"
     if extra:
         line += " " + " ".join(f"{k}={v}" for k, v in extra.items())
     print(line)
@@ -1475,7 +1481,10 @@ def publish(ctx: Ctx, req: dict, attempt: str, target: str, candidate: str, atte
     Git may have staged the candidate into the checkout before the ref update failed, and the primary belongs
     to its operator, so the request fails closed with a durable notice."""
     rid = req["request_id"]
-    check_checkout(ctx, changed_paths(ctx, target, candidate))
+    try:  # nothing has touched the checkout yet: a not-ready checkout is a bounded, unpenalised wait
+        check_checkout(ctx, changed_paths(ctx, target, candidate))
+    except Fail as f:
+        raise CheckoutWait(f)
     if rev_parse(ctx, ctx.target) != target:
         raise TargetMoved()
     receipt = {"old": target, "new": candidate, "attempt": attempt, "at": now()}
@@ -1485,8 +1494,10 @@ def publish(ctx: Ctx, req: dict, attempt: str, target: str, candidate: str, atte
         if rev_parse(ctx, ctx.target) != target:
             raise TargetMoved()
         check_checkout(ctx, changed_paths(ctx, target, candidate))
-    except (TargetMoved, Fail):
+    except (TargetMoved, Fail) as exc:
         mutate(ctx, rid, lambda r: r.update(publication=None))
+        if isinstance(exc, Fail):  # still before Git ran: wait for the checkout rather than fail terminally
+            raise CheckoutWait(exc)
         raise
     auth = ctx.p("auth", f"{rid}.json")
     write_json(auth, {"ref": ctx.target, "old": target, "new": candidate, "request_id": rid, "created": time.time(),
@@ -1564,8 +1575,12 @@ def finish_landed(ctx: Ctx, rid: str, landed: str, note: str) -> None:
     if not is_ancestor(ctx, landed, final):
         raise Infra(f"post-publication verification failed: {landed[:12]} is not in {ctx.target}")
     finished = now()
+    had_wait = []
 
     def done(r):
+        had_wait.append(bool(r.get("checkout_wait_since")))
+        for key in ("checkout_wait_since", "checkout_wait_reason"):
+            r.pop(key, None)
         r.update(state="landed", phase=None, publication=r.get("publication"))
         r["result"] = {"outcome": "landed", "landed_sha": landed, "target_after": final, "note": note,
                        "finished_at": finished, "logs_retained": False}
@@ -1574,21 +1589,30 @@ def finish_landed(ctx: Ctx, rid: str, landed: str, note: str) -> None:
         if r.get("fast_path"):
             r["fast_path"].pop("log", None)
     req = mutate(ctx, rid, done)
+    if any(had_wait):
+        sync_checkout_notice(ctx)
     for ref in (source_ref(rid), candidate_ref(rid)):
         ref_delete(ctx, ref)
     shutil.rmtree(ctx.p("evidence", rid), ignore_errors=True)
     event(ctx, "landed", rid, landed=landed, note=note, attempts=req["attempts"])
 
 
-def check_checkout_ready(ctx: Ctx, req: dict, target: str) -> None:
-    """Cheap pre-publication check of the integration checkout. A not-ready checkout (dirty, untracked, overlapping,
-    wrong branch) is a bounded wait (CheckoutWait), not a terminal failure; publish() re-checks exactly."""
+def note_checkout_readiness(ctx: Ctx, req: dict, target: str) -> None:
+    """Cheap look at the integration checkout at the top of a pass. It only records (never acts): a not-ready
+    checkout (dirty, untracked, overlapping, wrong branch) keeps the earliest `checkout_wait_since` and the current
+    reason on the receipt and in the operator notice, while preparation and validation continue; a ready one clears
+    them. publish() re-checks exactly and turns a not-ready checkout into the bounded wait (CheckoutWait)."""
     rid, src = req["request_id"], req["source_commit_sha"]
     try:
         base = git("merge-base", target, src, cwd=ctx.checkout).stdout.strip()
         check_checkout(ctx, changed_paths(ctx, base, src))
     except Fail as f:
-        raise CheckoutWait(f)
+        since = req.get("checkout_wait_since") or now()
+        reason = f"{f.ftype}: {f.message}"[:500]
+        if (req.get("checkout_wait_since"), req.get("checkout_wait_reason")) != (since, reason):
+            mutate(ctx, rid, lambda r: r.update(checkout_wait_since=since, checkout_wait_reason=reason))
+            sync_checkout_notice(ctx)
+        return
     if req.get("checkout_wait_since"):
         mutate(ctx, rid, lambda r: [r.pop(k, None) for k in ("checkout_wait_since", "checkout_wait_reason")])
         sync_checkout_notice(ctx)
@@ -1655,7 +1679,7 @@ def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, inte
             return finish_landed(ctx, rid, src, "already contained in the target")
         if refresh and state.get("deadline") is not None and state["deadline"] - time.monotonic() <= 0:
             raise Infra("land time budget exhausted before a refresh; retrying later")
-        check_checkout_ready(ctx, req, target)
+        note_checkout_readiness(ctx, req, target)
         if exact_reuse_ok(ctx, req, target):
             # Same target, same pinned candidate, same policy: the earlier gate result is exactly this one.
             # Publish under the lock we already hold (publish() still does its own fresh checkout/target checks).

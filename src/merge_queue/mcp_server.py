@@ -261,12 +261,14 @@ async def follow_request(ctx, fetch, label: str, timeout_seconds: float, progres
     async def snapshot():
         nonlocal last, count
         req = fetch()
-        meaningful = (req["state"], req.get("phase"), req.get("attempts"))
+        wait = req.get("checkout_wait_reason") if req["state"] not in core.TERMINAL else None
+        meaningful = (req["state"], req.get("phase"), req.get("attempts"), wait)
         if meaningful != last:
             last = meaningful
             count += 1
             await progress.report_progress(count, message=f"{label}: {req['state']}"
-                                           + (f" / {req['phase']}" if req.get("phase") else ""))
+                                           + (f" / {req['phase']}" if req.get("phase") else "")
+                                           + (f"; waiting for the integration checkout: {wait}" if wait else ""))
         return req
 
     def accept_for(req):
