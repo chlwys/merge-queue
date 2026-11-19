@@ -73,7 +73,10 @@ listed in `<root>/repos/<repo-id>.json` (see the [operations guide](operations.m
 | `seq` | FIFO counter (recoverable from the surviving requests if lost) |
 
 All writes are atomic (temp file, `fsync`, rename, directory `fsync`). Evidence and `refs/merge-queue/*`
-pins are removed on landing or acknowledgement.
+pins are removed on landing or acknowledgement. The runner's periodic `gc` also removes what outlived its
+request: per-request lock files (`locks/<id>.lock`, `<id>.rw`, `mcp-<id>.lock`) and `mcp-receipts/<id>.json`
+for ids with neither a request nor a tombstone, untouched for a day and not held, plus inbox owner
+directories that have been empty for a day. The fixed locks are never removed.
 
 ## Request states
 
@@ -103,13 +106,39 @@ action, `12` superseded (replaced by a retry; the result names `superseded_by`),
 2. **Validate.** The changed paths between the target and the candidate select checks from the policy
    (see [policy.md](policy.md)). Every step runs in its own process group with a timeout. Setup and planner
    failures are infrastructure failures; only the check step itself can blame the owner. A check must not
-   modify tracked files (`candidate_mutated`).
+   modify tracked files (`candidate_mutated`). A policy may opt into running independent check chains
+   concurrently (`parallel`); the default is sequential. A passing normal-lane validation is recorded on the
+   receipt (`validated`, with the SHA-256 of the policy bytes) so that it is not repeated needlessly, see
+   [Validation reuse](#validation-reuse).
 3. **Publish.** With the integration lock held, the checkout is re-checked (branch, tracked changes,
    unknown untracked paths, overlap of incoming paths with runtime or ignored files). A receipt
    (`old`, `new`) is written, then `git merge --ff-only --no-autostash <candidate>` runs with
    `MERGE_QUEUE_PUBLICATION=<id>`. If the target moved meanwhile, the candidate is refreshed (at most three
-   times per attempt). A crash after publication is reconciled by ancestry; accepted changes are never
-   replayed.
+   times per attempt). A target that moves on every refresh pass requeues the request without consuming an
+   attempt; the dispatch cap still bounds that. A crash after publication is reconciled by ancestry; accepted
+   changes are never replayed.
+
+### Validation reuse
+
+A normal-lane validation that passed leaves `validated = {target, candidate, paths, checks, policy, at}` on the
+receipt, where `policy` is the SHA-256 of the exact policy file bytes. It is only ever used again when the trusted
+policy bytes are unchanged:
+
+* **Exact reuse.** A later pass with the same target tip and the same pinned candidate
+  (`refs/merge-queue/candidate/<id>`) publishes under the lock it already holds, without preparing or
+  validating (event `validation_reused`, `mode: exact`). This is how a request that waited for the checkout at
+  publication lands once the checkout is ready.
+* **Carry-over.** After the target moved, a passed check is carried to the new combined candidate only when
+  the old validated target is an ancestor of the new one, the candidate's changed paths are unchanged and still
+  select exactly the recorded checks, `carry_validation` is not `false`, and no intervening target change is
+  unrouted or routed to that check. Everything else reruns (`mode: carried`; `plan.results_reused`,
+  `reused_checks`, `reused_from`).
+
+The contract is unchanged: candidate validation is against the combined result. Every check the policy routes
+the intervening paths to runs against the combined result, and a verdict is carried only when the trusted
+policy says those paths cannot affect it. The inline lane never records or reuses, a validation skipped with
+`--skip-tests` is never recorded, and a failed or fallen-back request drops the record. Details:
+[policy.md](policy.md#reusing-a-passed-validation).
 
 ### Integration lock and publication binding
 
@@ -130,6 +159,13 @@ by both its bundled Git path and kernel-reported Desktop executable in the proce
 exception verifies the official GitHub code signature, fails closed on process-inspection errors and never applies to queue publications. Pre-existing hooks are chained
 (`<hook>.merge-queue-chained`) and restored by `uninstall`.
 
+### Waiting for the integration lock
+
+The lock is held only for readiness checks and publication, so a holder finishes within the publication
+timeout. A starting `land` waits up to `MERGE_QUEUE_LOCK_WAIT` seconds (default 60) for it before requeueing
+(exit 75); after validation, and when a refresh pass needs it again, it waits up to `MERGE_QUEUE_PUBLISH_TIMEOUT`
+plus 30 seconds, capped by the remaining land budget, rather than discarding a validation that passed.
+
 ### Stale `tq` rows
 
 `tq`'s own cleanup sends SIGTERM to the recorded child pid of a running row whose parent is gone, without
@@ -140,12 +176,16 @@ start time and argv all match), nothing is dispatched, `notices/stale-tq.json` n
 
 ### A not-ready checkout waits, then fails
 
-Before preparing a candidate, each pass checks the integration checkout. If it is dirty, has unrecognised
-untracked paths, overlaps the incoming paths or is on another branch, the request is requeued **without
-penalty** (no attempt or dispatch is consumed) and re-dispatched after about 30 seconds
-(`MERGE_QUEUE_CHECKOUT_WAIT_DELAY`). `notices/checkout-wait.json` names the waiting requests. After
-`checkoutWaitLimit` seconds (default 14400) the request fails terminally with the original `checkout_*`
-failure.
+Each pass looks at the integration checkout. If it is dirty, has unrecognised untracked paths, overlaps the
+incoming paths or is on another branch, this no longer stops preparation or validation: the reason is recorded
+at once on the receipt (`checkout_wait_since`, `checkout_wait_reason`) and in `notices/checkout-wait.json`,
+and the work continues. At publication, a not-ready checkout found before Git runs becomes the bounded wait:
+the request is requeued **without penalty** (no attempt or dispatch is consumed) and re-dispatched after about
+30 seconds (`MERGE_QUEUE_CHECKOUT_WAIT_DELAY`); the re-dispatch publishes through exact
+[validation reuse](#validation-reuse) when nothing else changed. After `checkoutWaitLimit` seconds (default
+14400) the request fails terminally with the original `checkout_*` failure. A failure after Git touched the
+checkout stays terminal. While the request is not terminal, `status` and `result` JSON carry
+`checkout_wait_since`, `checkout_wait_reason` and `last_failure`.
 
 ### A rejected fast-forward leaves the checkout dirty
 
@@ -172,7 +212,8 @@ Old runner logs that are not failure evidence are pruned; `logs-clear` removes o
 ## Process safety
 
 * Recorded process groups are signalled only after pid, start time and argv are verified; an unverifiable
-  pid is left alone and the record dropped.
+  pid is left alone and the record dropped. Identities are read with `ps` under `LC_ALL=C`, so every process
+  records and compares the same start-time text. Parallel validation chains are all listed in the attempt record.
 * A live child of a dangerous `tq` row counts as ours only if it matches an identity this queue persisted;
   a matching argv alone is not enough.
 * Landing matches are exact per request and per repository id, so a similarly named request or another

@@ -23,7 +23,7 @@ Parallel work is useful until several contributors try to update the same integr
 |---|---|
 | Several Claude Code or Codex tasks work on one repository | Each task keeps its own worktree; the normal queue serializes integration into the shared target. |
 | A developer works alongside autonomous coding agents | Humans and agents use the same committed-change workflow and project-owned validation rules. |
-| Two individually valid changes interact | Validation runs after rebasing onto the current target; a moved target triggers refresh and revalidation. |
+| Two individually valid changes interact | Validation runs after rebasing onto the current target; a moved target triggers refresh and revalidation, reusing a passed check only where the policy proves it unaffected. |
 | A long agent session disconnects | The request and evidence are durable. Reconnect to the same receipt instead of submitting the work again. |
 | One machine has several active repositories | Repositories have separate queue state and locks. One MCP configuration can discover every installed repository. |
 | You want a quick visual status check | The macOS menu-bar app shows one repository, its active request and elapsed time, waiting work on Earth, and station completion details. |
@@ -216,7 +216,7 @@ See the [macOS app guide](apps/macos/README.md) for state-root configuration, th
 
 ## Safety model
 
-- **Combined-candidate validation:** the policy runs against a candidate rebased onto the current target, then runs again if the candidate must be refreshed.
+- **Combined-candidate validation:** the policy runs against a candidate rebased onto the current target, then runs again if the candidate must be refreshed. A passed check is carried over only when the trusted policy proves the intervening changes cannot affect it (`carry_validation: false` turns that off).
 - **Trusted policy ownership:** the integration checkout supplies the policy. A submitted candidate cannot change the rules that judge itself.
 - **Fresh publication checks:** guarded local fast-forwards check branch, tracked cleanliness, unrecognized untracked files, and path overlap with runtime data. The queue never resets your integration checkout to manufacture cleanliness.
 - **Durable recovery:** receipts, acceptance intents, and process identities support reconnect and bounded crash recovery. Failures return evidence to the owner or operator.

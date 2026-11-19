@@ -37,8 +37,9 @@ operations just to validate prose.
 - Retry follows repair and a new commit where applicable, links to the original receipt, and receives a new
   request ID. Do not conflate retry with duplicate submit.
 - Queue execution and policy own validation. MCP is a narrow adapter, not a shell or policy override.
-- Candidate validation is against the combined result. Publication remains a guarded local fast-forward;
-  remote push approval is separate.
+- Candidate validation is against the combined result: every check the policy routes the intervening target
+  paths to runs against it, and a passed verdict is carried only when the trusted policy says those paths cannot
+  affect it. Publication remains a guarded local fast-forward; remote push approval is separate.
 - Keep readers event-driven with native filesystem notifications. Do not add status polling loops or
   background session-resume machinery.
 - Keep examples portable. Do not add automatic installs, global settings edits, credentials, home paths,

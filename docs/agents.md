@@ -33,6 +33,11 @@ merge-queue result feature-task-001 --owner feature-task --wait --timeout 7200
 Never resubmit to recover an uncertain response. Preserve the receipt and inspect its terminal outcome.
 Statuses and list commands are diagnostic snapshots, not waiting mechanisms.
 
+A pending request may report `waiting for the integration checkout: <reason>` in its MCP progress message (and
+`waiting=<reason>` in CLI `result` text). That is an operator-side condition on the integration checkout: the
+queue keeps validating, publishes once the checkout is ready and fails only after its bounded wait limit.
+Keep the same wait pending; do not resubmit or retry.
+
 ## Repair and retry
 
 If a request fails, read its result and follow the reported owner or operator action. Repair the source in

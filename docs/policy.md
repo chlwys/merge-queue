@@ -22,8 +22,10 @@ switch: a contributor cannot choose, shorten or weaken the gate.
 }
 ```
 
-Optional `fast_path` is described below. Other top-level keys (for example `comment`) are ignored. See
-[`examples/policy.example.json`](../examples/policy.example.json).
+Optional top-level keys: `parallel` (integer >= 1, default `1`, see [Checks](#checks-what-runs)),
+`carry_validation` (boolean, default `true`, see [Reusing a passed validation](#reusing-a-passed-validation))
+and `fast_path` (described below). A wrong type makes the policy invalid. Other top-level keys (for example
+`comment`) are ignored. See [`examples/policy.example.json`](../examples/policy.example.json).
 
 ### Rules: routing changed paths to checks
 
@@ -40,7 +42,8 @@ POSIX paths.
 * **Unmatched paths fail closed.** If any changed path matches no rule, nothing runs and the request is
   blocked as `unknown_scope` (operator action: extend the policy). Use `merge-queue policy check` (below)
   to find uncovered paths before they block a landing.
-* Selected checks run **in the order they appear in `checks`**, one after the other, each at most once.
+* Selected checks are ordered **as they appear in `checks`** and each runs at most once. By default they run
+  one after the other; `"parallel": N` (below) lets up to `N` of them run at the same time.
 
 ### Checks: what runs
 
@@ -61,9 +64,47 @@ is looked up on `PATH`.
 
 Rules of the run: the check executes in the candidate worktree, in its own process group (so a timeout or
 termination reaps every descendant). It must not modify tracked files or move `HEAD`; if it does, the
-request is blocked as `candidate_mutated` (operator failure). Setup and planner steps never blame the owner:
+request is blocked as `candidate_mutated` (operator failure). With `parallel` the check runs concurrently with
+others in the same worktree, so it must also not depend on running alone. Setup and planner steps never blame the owner:
 a failing or timed-out step there, or one cut short by the landing's time budget, is an infrastructure
 failure that is retried with a bounded number of attempts.
+
+### Parallel checks
+
+`"parallel": N` (an integer >= 1; the default `1` keeps everything sequential) lets the queue run up to `N`
+check chains at once when more than one check has to run. At most `N` chains run at a time, and they start in
+policy order. A chain is one check's own plan, setup and check steps, in their usual order; every chain has its
+own process group, logs, timeouts and recorded step results. The first failing chain stops the others; the
+failure reported is that of the earliest check in policy order among the chains that failed (a chain stopped
+because another failed is not a failure); no new chain starts after a failure. A change to tracked files or `HEAD` is detected once all chains have
+finished, since concurrent chains cannot attribute it to one of them (`candidate_mutated`, as above). Use it
+only for checks that are safe to run side by side in one worktree.
+
+### Reusing a passed validation
+
+After a normal-lane validation passes, the receipt records `validated`: `target`, `candidate`, the changed
+`paths`, the selected `checks`, `policy` (the SHA-256 of the policy file's exact bytes) and `at`. The inline
+lane never records or reuses, and a validation skipped with `--skip-tests` is never recorded.
+
+* **Exact reuse.** When the request is dispatched again with the same target tip, the same pinned candidate
+  (`refs/merge-queue/candidate/<id>`) and the same policy bytes (for example after a bounded wait for the
+  integration checkout), the queue publishes without preparing or validating again.
+* **Carry-over after the target moved.** A passed check is carried to the freshly rebased candidate only when
+  all of these hold; otherwise it runs again:
+  * the policy file is byte-for-byte the one that validated, and `carry_validation` is not `false`;
+  * the previously validated target is an ancestor of the new target tip;
+  * the new candidate's changed paths equal the recorded `paths` and still select exactly the recorded checks;
+  * no path changed on the target in between is unrouted (an unrouted one reruns everything);
+  * no such intervening path is routed to that check.
+
+  Every check the policy routes the intervening paths to therefore runs against the combined result; a
+  verdict is carried only when the trusted policy says those paths cannot affect it. Checks that are not
+  carried run as usual (in parallel if configured).
+
+The receipt's `plan` then shows `results_reused`, `reused_checks` and `reused_from` (`target`, `candidate`) and
+the diagnostics log an event `validation_reused` with `mode` `exact` or `carried`. `"carry_validation": false`
+disables carry-over only; exact reuse stays. The recorded verdict is a convenience of the trusted policy, not a
+contributor option: a contributor cannot request or prevent it.
 
 ## Partial testing: the planner protocol
 
@@ -134,6 +175,11 @@ from candidate code. Its final line starting with `{` must contain a JSON object
 `eligible` and a string `reason`; extra details are retained on the receipt. Timeout defaults to 30 seconds
 and must be greater than zero and at most 120 seconds. Use `{checkout}` in focused check commands to invoke
 trusted tooling while checking the isolated candidate. There is no contributor opt-in or skip flag.
+
+When every changed path is routed by the policy and no check is selected for any of them (all matching rules
+have `"checks": []`), the request is inline-eligible with `checks: []` even without a `fast_path` section: no
+planner runs and nothing needs validating. Unrouted paths still fail closed, and the classification after
+preparing can still send the request back to the normal queue.
 
 Submission classifies source changes relative to the merge base with the current target. Eligible requests
 run inline, with a durable receipt and no `tq` task or FIFO wait; only the listed focused checks run, without

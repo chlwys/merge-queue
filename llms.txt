@@ -10,7 +10,7 @@
 
 ## Operating the queue
 
-- [Validation policy](https://github.com/chlwys/merge-queue/blob/main/docs/policy.md): trusted rules/checks, full path coverage, selective setup and inline fast-lane classification.
+- [Validation policy](https://github.com/chlwys/merge-queue/blob/main/docs/policy.md): trusted rules/checks, full path coverage, selective setup, optional parallel checks, policy-scoped reuse of passed validation and inline fast-lane classification.
 - [Operations](https://github.com/chlwys/merge-queue/blob/main/docs/operations.md): installation, separate repository queues, state paths, runner supervision and uninstall.
 - [Architecture](https://github.com/chlwys/merge-queue/blob/main/docs/architecture.md): request states, Git publication guards, crash recovery and exit codes.
 - [Example policy](https://github.com/chlwys/merge-queue/blob/main/examples/policy.example.json): illustrative configuration; adapt to the actual project's checks.

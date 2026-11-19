@@ -66,6 +66,12 @@ merge-queue runner --drain          # exit once nothing is pending
 merge-queue runner --idle-exit 300
 ```
 
+About every ten minutes the runner also tidies state (`gc`): landed and superseded receipts older than a day
+become tombstones, old non-evidence `tq` logs are pruned, and leftovers of vanished requests are removed:
+per-request lock files, `mcp-receipts/<id>.json` for ids with no request and no tombstone (untouched for a day,
+lock not held) and inbox owner directories that have been empty for a day. Failure evidence and unacknowledged
+failures are kept.
+
 Run it under any supervisor (systemd user unit, launchd, tmux, a process manager). The runner holds a lock,
 so a second one waits instead of exiting, which keeps a restarting supervisor from looping. launchd is
 entirely optional:
@@ -92,6 +98,9 @@ directory of `git`, `uv` or `npm`): a supervisor-run runner does not read your s
 | `logs [--level off\|basic\|debug] [-n N]`, `logs-clear` | optional diagnostics; never removes requests, inbox entries or failure evidence |
 | `doctor [--recover]`, `config`, `policy check` | diagnosis, resolved configuration, policy validation |
 | `uninstall` | remove hooks (restoring chained ones), configuration and registry entry; state is kept |
+
+`retry --wait` on a retry that already exists for the same commit waits for that receipt and returns its
+outcome code, like the first call would.
 
 Owner id: `--owner`, else `$MERGE_QUEUE_OWNER`, else `$CODEX_THREAD_ID`, else the worktree directory name.
 
@@ -126,7 +135,9 @@ After upgrading, rerun `merge-queue install` to refresh existing hooks.
 
 Avoid editing the integration checkout while a landing runs (check `status` first). For a long manual
 session, let active work finish and stop the runner; afterwards leave a clean checkout on the target branch
-and start it again. Pending requests remain durable and are revalidated against the changed target.
+and start it again. Pending requests remain durable and are revalidated against the changed target (a passed
+check is carried over only where the policy's routing proves the intervening changes cannot affect it, see
+[policy.md](policy.md#reusing-a-passed-validation)).
 
 An installed `fast_path` policy automatically routes eligible tiny presentation changes inline. The
 `submit`/`retry` CLI returns after acceptance unless `--wait` is requested, for both lanes.
@@ -161,7 +172,8 @@ owner's next session, and `inbox` always works.
 | `MERGE_QUEUE_MANUAL` | deprecated; grants no local or remote authorization |
 | `MERGE_QUEUE_PUSH_APPROVED=1` | allow pushing the target for that push |
 | `MERGE_QUEUE_NO_AUTORUNNER` | `submit` does not start an on-demand runner |
-| `MERGE_QUEUE_PUBLISH_TIMEOUT` | seconds `git merge --ff-only` may run (default 300) |
+| `MERGE_QUEUE_PUBLISH_TIMEOUT` | seconds `git merge --ff-only` may run (default 300); a landing waits this plus 30 seconds for the integration lock after validation |
+| `MERGE_QUEUE_LOCK_WAIT` | seconds a starting landing waits for the integration lock before it is requeued (default 60) |
 | `MERGE_QUEUE_LAND_BUDGET` | override the landing time budget in seconds |
 | `MERGE_QUEUE_CHECKOUT_WAIT_DELAY` | seconds before a request waiting for the checkout is retried (default 30) |
 | `MERGE_QUEUE_BACKOFF` | base of the requeue backoff in seconds (default 5) |
@@ -175,8 +187,9 @@ owner's next session, and `inbox` always works.
   own. Check the pid by hand; if unrelated, an operator clears the row with `tq` itself (the queue never
   edits `tq`'s database or runs `tq clear`). Dispatch resumes once it is gone.
 * **`WAITING FOR CHECKOUT`**: the integration checkout is dirty, has unrecognised untracked paths, overlaps
-  the incoming change or is on another branch. Resolve the listed paths; requests resume by themselves, or
-  fail after the wait limit.
+  the incoming change or is on another branch. The reason is on the receipt (`checkout_wait_reason`; text
+  `result` shows `waiting=<reason>`) while preparation and validation continue. Resolve the listed paths;
+  requests publish by themselves once the checkout is ready, or fail after the wait limit.
 * **`unknown_scope`**: add the path to the policy (`merge-queue policy check` lists uncovered paths), land
   that change, then `merge-queue retry <id>`.
 * **`publication_checkout_dirty`**: a rejected fast-forward left staged changes. Inspect `git status` in the

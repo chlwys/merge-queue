@@ -72,7 +72,8 @@ These never bind an intent, create a lock, a directory or any file under the sta
 Results:
 
 * `watch_request`: the request summary (`request_id`, `owner_id`, `state`, `phase`, `source_commit_sha`,
-  `target_sha`, `seq`, `result`, ...) plus `terminal`, `timed_out`, `exit_code` (same codes as the CLI: `0`
+  `target_sha`, `seq`, `result`, ...; while not terminal also `checkout_wait_since`, `checkout_wait_reason` and
+  `last_failure` when set) plus `terminal`, `timed_out`, `exit_code` (same codes as the CLI: `0`
   landed, `10` owner action, `11` operator action, `12` superseded, `20` infrastructure, `30` pending),
   `repository` (the common Git directory) and `receipt_path`. A non-terminal result carries `next_action`.
 * `wait_for_queue_empty`: `{empty, timed_out, repository, repo_id, observed_at, pending: [request ids]}`.
@@ -90,7 +91,10 @@ initial snapshot, then one snapshot at the watcher's first event or one-second s
 read/registration race), then one per later event. Quiet internal wake-ups do not read queue state or notify
 the client. Only meaningful changes emit MCP progress under the caller's progress token:
 
-* per request: a change of `(state, phase, attempts)`, message `"<id>: <state> / <phase>"`;
+* per request: a change of `(state, phase, attempts)` or of the integration-checkout wait reason, message
+  `"<id>: <state> / <phase>"`, followed by `"; waiting for the integration checkout: <reason>"` while the
+  request is not terminal and the checkout is not ready (the request keeps validating; see
+  [architecture](architecture.md#a-not-ready-checkout-waits-then-fails));
 * queue empty: a change of the pending set, message `"<n> pending: <id>, ..."`.
 
 There are no periodic "still waiting" heartbeats and **no polling fallback**: a native watcher error surfaces
