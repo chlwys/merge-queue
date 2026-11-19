@@ -71,8 +71,7 @@ async def common_dir(worktree: str, root_only=True) -> tuple[Path, Path]:
 
 
 def raw_receipt(ctx, request_id):
-    return (core.load_req(ctx, request_id)
-            or core.read_json(ctx.p("tombstones", f"{request_id}.json")))
+    return core.receipt(ctx, request_id)
 
 
 def intent_path(ctx, request_id):

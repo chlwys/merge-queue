@@ -402,24 +402,37 @@ def mutate(ctx: Ctx, rid: str, fn, allow_terminal_change=False):
         return req
 
 
+def read_records(directory: Path, ordered=False) -> list[dict]:
+    """Every non-empty JSON record in a directory (none when it does not exist); `ordered` sorts by file name."""
+    if not directory.is_dir():
+        return []
+    paths = sorted(directory.glob("*.json")) if ordered else directory.glob("*.json")
+    return [d for d in (read_json(p) for p in paths) if d]
+
+
 def all_requests(ctx: Ctx) -> list[dict]:
-    items = []
-    directory = ctx.p("requests")
-    if directory.is_dir():
-        for path in directory.glob("*.json"):
-            data = read_json(path)
-            if data:
-                items.append(data)
-    return sorted(items, key=lambda r: r["seq"])
+    return sorted(read_records(ctx.p("requests")), key=lambda r: r["seq"])
 
 
 def tombstones(ctx: Ctx) -> list[dict]:
-    directory = ctx.p("tombstones")
-    return [d for d in (read_json(p) for p in directory.glob("*.json")) if d] if directory.is_dir() else []
+    return read_records(ctx.p("tombstones"))
+
+
+def receipt(ctx: Ctx, rid: str) -> dict | None:
+    """The live request, else its tombstone (named <id>.json), else None."""
+    return load_req(ctx, rid) or read_json(ctx.p("tombstones", f"{rid}.json"))
 
 
 def owner_dir(ctx: Ctx, owner: str) -> Path:
     return ctx.p("inbox", re.sub(r"[^A-Za-z0-9._-]", "_", owner)[:64] or "_")
+
+
+def inbox_path(ctx: Ctx, owner: str, rid: str) -> Path:
+    return owner_dir(ctx, owner) / f"{rid}.json"
+
+
+def new_request_id() -> str:
+    return f"mq-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
 def rev_parse(ctx: Ctx, ref: str, cwd=None) -> str:
@@ -470,32 +483,65 @@ def owner_candidates(args, cwd, extra=()) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def find_duplicate(ctx: Ctx, rid: str, sha: str, requests: list[dict], tombs: list[dict]) -> dict | None:
+    """The existing receipt that makes a submission of `sha` under `rid` a duplicate, None if it is new.
+    Raises MqError for an id bound to another commit and for a commit that already failed (retry it)."""
+    existing = load_req(ctx, rid)
+    if existing:
+        if existing["source_commit_sha"] != sha:
+            raise MqError(f"request id {rid} already used for {existing['source_commit_sha'][:12]}; "
+                          "ids are bound to one exact commit", 4)
+        return existing
+    for tomb in tombs:
+        if tomb["request_id"] == rid:
+            if tomb["source_commit_sha"] != sha:
+                raise MqError(f"request id {rid} already used for another commit", 4)
+            return tomb
+    for other in requests:
+        if other["source_commit_sha"] != sha or other["state"] == "superseded":
+            continue
+        if other["state"] not in FAILED or other["result"].get("failure_class") == "owner":
+            if other["state"] in FAILED:
+                raise MqError(f"commit {sha[:12]} already failed in {other['request_id']} "
+                              f"({other['state']}); run `merge-queue retry {other['request_id']}`", 4)
+            return other
+    for tomb in tombs:
+        if tomb["source_commit_sha"] == sha and tomb["state"] == "landed":
+            return tomb
+    return None
+
+
+def snapshot_records(ctx: Ctx) -> tuple[list[dict], list[dict]]:
+    """Requests, then tombstones: an acknowledgement writes the tombstone before it removes the request, so this
+    order never misses a record that is being acknowledged."""
+    return all_requests(ctx), tombstones(ctx)
+
+
+def classify_submission(ctx: Ctx, rid: str, sha: str) -> dict:
+    """Route a new submission. Depends only on the target and the commit, so it runs outside `submit.lock`:
+    a slow planner must not block other submits."""
+    target = rev_parse(ctx, ctx.target)
+    routing_base = git("merge-base", target, sha, cwd=ctx.checkout).stdout.strip()
+    return classify_fast_path(ctx, rid, routing_base, sha)
+
+
 def create_request(ctx: Ctx, *, rid, owner, sha, branch, started_at=None, retry_of=None, skip_tests=None) -> tuple[dict, bool]:
     """Persist a request unless an equivalent one exists. Returns (request, created)."""
+    decision = None
+    try:  # unlocked pre-check: an obvious duplicate needs no routing (the locked check below stays authoritative)
+        if find_duplicate(ctx, rid, sha, *snapshot_records(ctx)) is None:
+            decision = classify_submission(ctx, rid, sha)
+    except MqError:
+        pass
     with FileLock(ctx.p("locks", "submit.lock")):
-        existing = load_req(ctx, rid)
-        if existing:
-            if existing["source_commit_sha"] != sha:
-                raise MqError(f"request id {rid} already used for {existing['source_commit_sha'][:12]}; "
-                              "ids are bound to one exact commit", 4)
-            return existing, False
-        for tomb in tombstones(ctx):
-            if tomb["request_id"] == rid:
-                if tomb["source_commit_sha"] != sha:
-                    raise MqError(f"request id {rid} already used for another commit", 4)
-                return tomb, False
-        for other in all_requests(ctx):
-            if other["source_commit_sha"] != sha or other["state"] == "superseded":
-                continue
-            if other["state"] not in FAILED or other["result"].get("failure_class") == "owner":
-                if other["state"] in FAILED:
-                    raise MqError(f"commit {sha[:12]} already failed in {other['request_id']} "
-                                  f"({other['state']}); run `merge-queue retry {other['request_id']}`", 4)
-                return other, False
-        for tomb in tombstones(ctx):
-            if tomb["source_commit_sha"] == sha and tomb["state"] == "landed":
-                return tomb, False
-        seq = next_seq(ctx)
+        requests, tombs = snapshot_records(ctx)
+        duplicate = find_duplicate(ctx, rid, sha, requests, tombs)
+        if duplicate:
+            discard_decision(ctx, rid, decision)
+            return duplicate, False
+        if decision is None:  # the pre-check saw a duplicate that has since gone
+            decision = classify_submission(ctx, rid, sha)
+        seq = next_seq(ctx, requests, tombs)
         created = started_at
         if not created:
             log = git("log", "--format=%aI", "--reverse", f"{ctx.target}..{sha}", cwd=ctx.checkout, check=False)
@@ -509,9 +555,6 @@ def create_request(ctx: Ctx, *, rid, owner, sha, branch, started_at=None, retry_
                "timings": {}, "result": {}, "retry_of": retry_of}
         if skip_tests:
             req["skip_tests"] = skip_tests
-        target = rev_parse(ctx, ctx.target)
-        routing_base = git("merge-base", target, sha, cwd=ctx.checkout).stdout.strip()
-        decision = classify_fast_path(ctx, rid, routing_base, sha)
         req.update(lane="inline" if decision["eligible"] else "normal", fast_path=decision,
                    inline_owner=proc_identity(os.getpid()) if decision["eligible"] else None)
         git("update-ref", source_ref(rid), sha, cwd=ctx.checkout)
@@ -520,13 +563,23 @@ def create_request(ctx: Ctx, *, rid, owner, sha, branch, started_at=None, retry_
     return req, True
 
 
-def next_seq(ctx: Ctx) -> int:
+def discard_decision(ctx: Ctx, rid: str, decision: dict | None) -> None:
+    """Remove only the planner log this submission wrote; the request's own evidence is never touched."""
+    if decision and decision.get("log"):
+        Path(decision["log"]).unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            ctx.p("evidence", rid).rmdir()  # only succeeds when nothing else lives there
+
+
+def next_seq(ctx: Ctx, requests: list[dict] | None = None, tombs: list[dict] | None = None) -> int:
     """Reserve the next FIFO number durably *before* the request exists; recoverable from any survivor."""
     try:
         recorded = int(ctx.p("seq").read_text())
     except (FileNotFoundError, ValueError):
         recorded = 0
-    known = [r["seq"] for r in all_requests(ctx)] + [t.get("seq", 0) for t in tombstones(ctx)]
+    requests = all_requests(ctx) if requests is None else requests
+    tombs = tombstones(ctx) if tombs is None else tombs
+    known = [r["seq"] for r in requests] + [t.get("seq", 0) for t in tombs]
     seq = max([recorded, *known]) + 1
     write_text(ctx.p("seq"), str(seq))
     return seq
@@ -585,7 +638,7 @@ def wait_terminal(ctx: Ctx, rid: str, timeout: float) -> dict:
     deadline = time.monotonic() + timeout
 
     def snapshot():
-        req = load_req(ctx, rid) or next((t for t in tombstones(ctx) if t["request_id"] == rid), None)
+        req = receipt(ctx, rid)
         if req is None:
             raise MqError(f"unknown request {rid}")
         return req
@@ -674,8 +727,7 @@ def cmd_submit(args):
     cwd = os.getcwd()
     ctx = load_ctx(cwd)
     sha, branch = resolve_source(args, ctx, cwd)
-    rid = valid_id(args.request_id, "request id") if args.request_id else \
-        f"mq-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    rid = valid_id(args.request_id, "request id") if args.request_id else new_request_id()
     req, created = create_request(ctx, rid=rid, owner=current_owner(args, cwd), sha=sha, branch=branch,
                                   started_at=args.started_at)
     req = start_submission(ctx, req, created)
@@ -705,8 +757,7 @@ def cmd_retry(args):
         if sha != old["source_commit_sha"]:
             raise MqError("--skip-tests requires the unchanged source commit from the failed receipt", 4)
         skip_tests = {"request_id": old["request_id"], "source_commit_sha": sha}
-    rid = valid_id(args.new_request_id, "request id") if args.new_request_id else \
-        f"mq-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    rid = valid_id(args.new_request_id, "request id") if args.new_request_id else new_request_id()
     bound = [x for x in (*all_requests(ctx), *tombstones(ctx)) if x["request_id"] == rid]
     if any(x["source_commit_sha"] != sha for x in bound):  # refuse before the old record is superseded
         raise MqError(f"request id {rid} already used for another commit; ids are bound to one exact commit", 4)
@@ -717,7 +768,7 @@ def cmd_retry(args):
     req, created = create_request(ctx, rid=rid, owner=old["owner_id"], sha=sha, branch=branch,
                                   started_at=old["created_at"], retry_of=old["request_id"], skip_tests=skip_tests)
     with contextlib.suppress(FileNotFoundError):
-        (owner_dir(ctx, old["owner_id"]) / f"{old['request_id']}.json").unlink()
+        inbox_path(ctx, old["owner_id"], old["request_id"]).unlink()
     ref_delete(ctx, source_ref(old["request_id"]))
     req = start_submission(ctx, req, created)
     if args.wait:
@@ -744,9 +795,7 @@ def latest_for_owner(ctx: Ctx, owners: list[str]):
 def inbox_entries(ctx: Ctx, owners: list[str]) -> list[dict]:
     entries = []
     for owner in owners:
-        directory = owner_dir(ctx, owner)
-        entries += [e for e in (read_json(p) for p in sorted(directory.glob("*.json"))) if e] \
-            if directory.is_dir() else []
+        entries += read_records(owner_dir(ctx, owner), ordered=True)
     return entries
 
 
@@ -767,11 +816,8 @@ def cmd_result(args):
 
 
 def tq_summary(ctx: Ctx) -> dict | None:
-    result = subprocess.run([ctx.tq, "--data-dir", str(ctx.tq_dir), "list", "--json"], capture_output=True,
-                            text=True, env=clean_env())
-    try:
-        tasks = [t for t in json.loads(result.stdout)["tasks"] if t["queue_name"] == ctx.queue]
-    except (ValueError, KeyError):
+    tasks = tq_tasks(ctx)
+    if tasks is None:
         return None
     return {"running": sum(t["status"] == "running" for t in tasks),
             "waiting": sum(t["status"] == "waiting" for t in tasks)}
@@ -856,7 +902,7 @@ def acknowledge(ctx: Ctx, rid: str) -> None:
                 acknowledged_at=now())
     write_json(ctx.p("tombstones", f"{rid}.json"), tomb)
     with contextlib.suppress(FileNotFoundError):
-        (owner_dir(ctx, req["owner_id"]) / f"{rid}.json").unlink()
+        inbox_path(ctx, req["owner_id"], rid).unlink()
     req_path(ctx, rid).unlink(missing_ok=True)
     shutil.rmtree(ctx.p("evidence", rid), ignore_errors=True)
     ref_delete(ctx, source_ref(rid))
@@ -895,6 +941,52 @@ def gc(ctx: Ctx) -> None:
     for path in ctx.p("runner").glob("tq-*.log") if ctx.p("runner").is_dir() else []:
         if str(path) not in keep and time.time() - path.stat().st_mtime > 86400:
             path.unlink(missing_ok=True)
+    prune_orphans(ctx)
+
+
+FIXED_LOCKS = {"integration", "submit", "runner"}  # `<name>.lock` files that are not per-request locks
+
+
+def prune_orphans(ctx: Ctx) -> None:
+    """Per-request lock files, MCP acceptance intents and empty inbox owner directories that outlived their
+    request. Only ids with neither a request nor a tombstone and untouched for a day qualify; a lock that is
+    held is never removed, and the fixed locks are never touched."""
+    known = {p.stem for name in ("requests", "tombstones") for p in
+             (ctx.p(name).glob("*.json") if ctx.p(name).is_dir() else [])}
+    cutoff = time.time() - 86400
+
+    def stale(path: Path) -> bool:
+        try:
+            return path.stat().st_mtime < cutoff
+        except OSError:
+            return False
+
+    locks = ctx.p("locks")
+    for path in sorted(locks.iterdir()) if locks.is_dir() else []:
+        if path.name.endswith(".rw"):
+            ids = [path.name[:-3]]
+        elif path.name.endswith(".lock") and path.name[:-5] not in FIXED_LOCKS:
+            stem = path.name[:-5]  # `mcp-<id>.lock` is also the landing lock of a request named `mcp-<id>`
+            ids = [stem, stem[4:]] if stem.startswith("mcp-") else [stem]
+        else:
+            continue
+        if known.intersection(ids) or not stale(path):
+            continue
+        probe = FileLock(path, blocking=False)
+        if probe.acquire():  # unlink while holding it: nobody else can be using it
+            try:
+                path.unlink(missing_ok=True)
+            finally:
+                probe.release()
+    intents = ctx.p("mcp-receipts")
+    for path in intents.glob("*.json") if intents.is_dir() else []:
+        if path.stem not in known and stale(path):
+            path.unlink(missing_ok=True)
+    inbox = ctx.p("inbox")
+    for directory in inbox.iterdir() if inbox.is_dir() else []:
+        if directory.is_dir() and stale(directory):  # empty for a day: no writer is about to use it
+            with contextlib.suppress(OSError):
+                directory.rmdir()  # fails (and is skipped) unless it is empty
 
 
 # ---------------------------------------------------------------- diagnostics commands
@@ -961,7 +1053,7 @@ def classify_fast_path(ctx: Ctx, rid: str, target: str, candidate: str,
     """Only the trusted integration policy/planner may shorten a gate. Errors enter the normal queue."""
     decision = {"eligible": False, "reason": "fast path is not configured", "target": target, "candidate": candidate}
     temporary = attempt_file is None
-    attempt_file = attempt_file or ctx.p("routing", f"{rid}.json")
+    attempt_file = attempt_file or ctx.p("routing", f"{rid}-{uuid.uuid4().hex[:8]}.json")  # unique: concurrent submits
     log = ctx.p("evidence", rid, f"fast-plan-{uuid.uuid4().hex[:8]}.log")
     try:
         policy = load_policy(ctx.policy)
@@ -975,13 +1067,11 @@ def classify_fast_path(ctx: Ctx, rid: str, target: str, candidate: str,
         if fast is None:
             return decision
         subst = {"target": target, "candidate": candidate, "checkout": str(ctx.checkout)}
-        argv = [a.format(**subst) for a in fast["plan"]]
-        if "/" in argv[0] and not os.path.isabs(argv[0]):
-            argv[0] = str(ctx.checkout / argv[0])
+        argv = policy_argv(fast["plan"], subst, ctx.checkout)
         code = run_group(argv, ctx.checkout, clean_env(), log, fast.get("timeout", 30), attempt_file)
         if code != 0:
             raise ValueError(f"planner exited {code}")
-        planned = json.loads([line for line in log.read_text().splitlines() if line.startswith("{")][-1])
+        planned = last_json_line(log)
         if type(planned.get("eligible")) is not bool or not isinstance(planned.get("reason"), str):
             raise ValueError("planner requires boolean eligible and string reason")
         decision.update(planned, target=target, candidate=candidate, checks=list(fast["checks"]))
@@ -993,6 +1083,19 @@ def classify_fast_path(ctx: Ctx, rid: str, target: str, candidate: str,
     if log.exists():
         decision["log"] = str(log)
     return decision
+
+
+def policy_argv(argv: list[str], subst: dict, cwd: Path) -> list[str]:
+    """Substitute the `{...}` placeholders of a policy command; a relative program path resolves under `cwd`."""
+    argv = [a.format(**subst) for a in argv]
+    if "/" in argv[0] and not os.path.isabs(argv[0]):
+        argv[0] = str(cwd / argv[0])
+    return argv
+
+
+def last_json_line(log: Path):
+    """The JSON object on the last line of `log` that starts with `{` (IndexError/ValueError/OSError if none)."""
+    return json.loads([line for line in log.read_text().splitlines() if line.startswith("{")][-1])
 
 
 def fast_authority(ctx: Ctx) -> str:
@@ -1061,7 +1164,6 @@ def changed_paths(ctx: Ctx, base: str, head: str) -> list[str]:
 class Guard:
     critical = 0
     pending = False
-    pgids: set = set()
 
 
 def _on_term(signum, frame):
@@ -1150,15 +1252,29 @@ def kill_verified_group(identity: dict | None, grace=1.0) -> bool:
     return True
 
 
-def sweep_stale(ctx: Ctx) -> int:
+def request_lock_busy(ctx: Ctx, rid: str) -> bool:
+    """True while another process holds the request's landing lock (a brief non-blocking probe)."""
+    probe = FileLock(ctx.p("locks", f"{rid}.lock"), blocking=False)
+    if not probe.acquire():
+        return True
+    probe.release()
+    return False
+
+
+def sweep_stale(ctx: Ctx, own: str | None = None) -> int:
     """Called with the integration lock held: no queue publication can be running (the lock is inherited by
-    the Git child), so leftovers of dead attempts are ours to clear, but only after identity checks."""
+    the Git child), so leftovers of dead attempts are ours to clear, but only after identity checks. An attempt
+    whose per-request lock is held by another process is live, whatever its recorded identity says; `own` is the
+    request this process itself holds the lock for."""
     cleaned = 0
     live_work = set()
     attempts = ctx.p("attempts")
     for path in attempts.glob("*.json") if attempts.is_dir() else []:
         data = read_json(path) or {}
         if proc_state(data.get("identity")) == "same":
+            live_work.add(f"{path.stem}-{data.get('attempt')}")
+            continue
+        if path.stem != own and request_lock_busy(ctx, path.stem):
             live_work.add(f"{path.stem}-{data.get('attempt')}")
             continue
         if kill_verified_group(data.get("group")):
@@ -1267,11 +1383,18 @@ def run_group(argv, cwd, env, log: Path, timeout: int, attempt_file: Path) -> in
             write_json(attempt_file, {**data, "group": None})
 
 
+TAIL_WINDOW = 64 * 1024
+
+
 def tail(path: Path, lines=20, limit=2000) -> str:
-    try:
-        return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])[-limit:]
+    try:  # only the end matters: never read a multi-megabyte log whole
+        with open(path, "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - TAIL_WINDOW))
+            data = handle.read()
     except OSError:
         return ""
+    return "\n".join(data.decode(errors="replace").splitlines()[-lines:])[-limit:]
 
 
 def prepare(ctx: Ctx, req: dict, attempt: str, target: str, state: dict) -> tuple[Path, str, str]:
@@ -1409,10 +1532,7 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
     results = []
     subst = {"target": target, "candidate": candidate, "worktree": str(work), "checkout": str(ctx.checkout)}
     def resolve(argv, cwd):
-        argv = [a.format(**subst) for a in argv]
-        if "/" in argv[0] and not os.path.isabs(argv[0]):
-            argv[0] = str(cwd / argv[0])
-        return argv
+        return policy_argv(argv, subst, cwd)
 
     def run_step(name, label, argv, cwd, spec, kind):
         log = ctx.p("evidence", rid, f"{attempt}-{name}-{label}.log")
@@ -1455,7 +1575,7 @@ def validate(ctx: Ctx, req: dict, attempt: str, work: Path, target: str, candida
         if spec.get("plan"):  # the project's own change-aware planner decides which dependency sets are needed
             plan_log = run_step(name, "plan", resolve(spec["plan"], cwd), cwd, spec, "plan")
             try:
-                planned = json.loads([l for l in plan_log.read_text().splitlines() if l.startswith("{")][-1])
+                planned = last_json_line(plan_log)
             except (IndexError, ValueError, OSError):
                 raise Infra(f"{name} plan produced no JSON; log {plan_log}")
             if planned.get("unknown"):  # fail before any dependency setup
@@ -1753,7 +1873,7 @@ def record_failure(ctx: Ctx, rid: str, f: Fail) -> None:
              "source_commit_sha": req["source_commit_sha"], "target_commit_sha": req.get("target_sha"),
              "failure_type": f.ftype, "failure_class": f.klass, "message": f.message, "conflicting_files": f.files,
              "relevant_log_paths": f.logs, "summary": f.summary, "required_action": f.action, "created_at": now()}
-    write_json(owner_dir(ctx, req["owner_id"]) / f"{rid}.json", entry)  # durable before the state flips
+    write_json(inbox_path(ctx, req["owner_id"], rid), entry)  # durable before the state flips
 
     def fin(r):
         r.update(state=f.state, phase=None)
@@ -1824,7 +1944,7 @@ def cmd_land(args):
     code = 0
     acquired = now()
     try:
-        sweep_stale(ctx)
+        sweep_stale(ctx, own=rid)
         ctx.p("auth", f"{rid}.json").unlink(missing_ok=True)
         write_json(ctx.p("attempts", f"{rid}.json"), {"identity": proc_identity(os.getpid()), "attempt": attempt,
                                                       "group": None})
@@ -2059,10 +2179,8 @@ def tick_request(ctx: Ctx, req: dict, children: dict, killing: dict, gate: dict)
         attempt = read_json(ctx.p("attempts", f"{rid}.json")) or {}
         if proc_state(attempt.get("identity")) == "same":
             return
-        probe = FileLock(ctx.p("locks", f"{rid}.lock"), blocking=False)
-        if not probe.acquire():
+        if request_lock_busy(ctx, rid):
             return
-        probe.release()
         if req["state"] == "running":
             requeue_or_fail(ctx, rid, "inline executor vanished")
             return
@@ -2590,12 +2708,12 @@ def cmd_doctor(args):
     add("registry", registry_matches(registered, ctx.common, {"stateDir": str(ctx.state), "checkout": str(ctx.checkout),
                                                             "target": ctx.target}), str(registry_path(ctx.repo_id)))
     missing = [r["request_id"] for r in all_requests(ctx) if r["state"] in FAILED
-               and not (owner_dir(ctx, r["owner_id"]) / f"{r['request_id']}.json").exists()]
+               and not inbox_path(ctx, r["owner_id"], r["request_id"]).exists()]
     if missing and args.recover:
         for rid in missing:
             req = load_req(ctx, rid)
             res = req["result"]
-            write_json(owner_dir(ctx, req["owner_id"]) / f"{rid}.json", {
+            write_json(inbox_path(ctx, req["owner_id"], rid), {
                 "request_id": rid, "owner_id": req["owner_id"], "repository": req["repository"],
                 "source_commit_sha": req["source_commit_sha"], "target_commit_sha": req.get("target_sha"),
                 "failure_type": res.get("failure_type"), "failure_class": res.get("failure_class"),
