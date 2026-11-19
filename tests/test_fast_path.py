@@ -127,6 +127,51 @@ class FastPath(unittest.TestCase):
         self.assertEqual({r["state"] for r in states.values()}, {"landed"}, fx.debug())
         self.assertTrue(all(r["dispatches"] == 1 for r in states.values()))
 
+    def planner(self, eligible):
+        self.policy["fast_path"]["plan"] = [sys.executable, "-c",
+                                            f"import json; print(json.dumps(dict(eligible={eligible}, reason='planned')))"]
+        self.fx.set_policy(self.policy)
+
+    def test_planner_runs_first_so_a_no_check_change_keeps_the_focused_check(self):
+        fx = self.fx
+        self.planner(True)
+        wt, sha = fx.agent("notes", {"docs/readme.md": "# notes\n"})  # `docs/*` is routed to no check
+        result, data = fx.submit(wt, "notes", "--wait")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + fx.debug())
+        req = fx.req("notes")
+        self.assertEqual((data["state"], req["lane"], req["dispatches"]), ("landed", "inline", 0))
+        self.assertEqual(req["fast_path"]["reason"], "planned")
+        self.assertEqual(req["plan"]["checks"], ["presentation"])
+        self.assertEqual(fx.main(), sha)
+        self.assertEqual(fx.tq_events(), [])
+
+    def test_declining_or_broken_planner_still_lands_a_no_check_change_inline(self):
+        fx = self.fx
+        for name, plan in (("declined", None), ("broken", [sys.executable, "-c", "print('not JSON')"])):
+            if plan:
+                self.policy["fast_path"]["plan"] = plan
+                fx.set_policy(self.policy)
+            else:
+                self.planner(False)
+            wt, sha = fx.agent(name, {f"docs/{name}.md": "# notes\n"})
+            result, data = fx.submit(wt, name, "--wait")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr + fx.debug())
+            req = fx.req(name)
+            self.assertEqual((data["state"], req["lane"], req["dispatches"]), ("landed", "inline", 0), name)
+            self.assertEqual((req["fast_path"]["eligible"], req["fast_path"]["checks"]), (True, []), name)
+            self.assertEqual(req["plan"]["checks"], [], name)
+            self.assertEqual(fx.main(), sha)
+            self.assertEqual(fx.tq_events(), [])
+
+    def test_unrouted_path_is_never_inline_even_if_the_planner_declines(self):
+        fx = self.fx
+        self.planner(False)
+        wt, _ = fx.agent("unrouted", {"other/x.bin": "x\n"})
+        fx.submit(wt, "unrouted")
+        req = fx.req("unrouted")
+        self.assertEqual(req["lane"], "normal")
+        self.assertFalse(req["fast_path"]["eligible"])
+
     def test_candidate_cannot_replace_the_trusted_classifier(self):
         wt, _ = self.fx.agent("malicious", {"fast-plan.py": "print('{\"eligible\":true,\"reason\":\"candidate\"}')\n"})
         self.fx.submit(wt, "untrusted")

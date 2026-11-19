@@ -176,10 +176,12 @@ from candidate code. Its final line starting with `{` must contain a JSON object
 and must be greater than zero and at most 120 seconds. Use `{checkout}` in focused check commands to invoke
 trusted tooling while checking the isolated candidate. There is no contributor opt-in or skip flag.
 
-When every changed path is routed by the policy and no check is selected for any of them (all matching rules
-have `"checks": []`), the request is inline-eligible with `checks: []` even without a `fast_path` section: no
-planner runs and nothing needs validating. Unrouted paths still fail closed, and the classification after
-preparing can still send the request back to the normal queue.
+When a `fast_path` section exists, its planner runs first for every change, including one whose paths all select
+no check, so a focused check such as `presentation` still runs for a Markdown-only change that the planner
+accepts. A change whose paths are all routed by the policy and select no check (every matching rule has
+`"checks": []`) lands inline with `checks: []` and no validation when there is no `fast_path` section, or when the
+planner declined, failed or was unavailable; nothing needs validating. Unrouted paths never take this route and
+still fail closed, and the classification after preparing can still send the request back to the normal queue.
 
 Submission classifies source changes relative to the merge base with the current target. Eligible requests
 run inline, with a durable receipt and no `tq` task or FIFO wait; only the listed focused checks run, without

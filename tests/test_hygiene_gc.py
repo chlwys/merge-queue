@@ -77,6 +77,21 @@ class GcOrphans(unittest.TestCase):
         self.mq.gc(self.ctx)
         self.assertTrue(lock.exists())
 
+    def test_mcp_intent_is_kept_while_its_bound_receipt_is_known(self):
+        # An intent under requested id R may be bound (`queue_request_id`) to another canonical receipt C by exact-SHA
+        # dedup; R itself has no request or tombstone, but `wait_for_result(R)` must keep resolving to C.
+        bound = self.make("mcp-receipts/alias.json", '{"queue_request_id": "canon"}\n')
+        self.make("requests/canon.json", "{}\n", old=False)
+        tombed = self.make("mcp-receipts/alias-t.json", '{"queue_request_id": "canon-t"}\n')
+        self.make("tombstones/canon-t.json", "{}\n", old=False)
+        unknown = self.make("mcp-receipts/alias-gone.json", '{"queue_request_id": "nowhere"}\n')
+        unbound = self.make("mcp-receipts/unbound.json", '{"owner_id": "o"}\n')
+        unreadable = self.make("mcp-receipts/garbled.json", "{not json")
+        recent = self.make("mcp-receipts/alias-recent.json", '{"queue_request_id": "nowhere"}\n', old=False)
+        self.mq.gc(self.ctx)
+        self.assertTrue(bound.exists() and tombed.exists() and recent.exists())
+        self.assertFalse(unknown.exists() or unbound.exists() or unreadable.exists())
+
     def test_empty_inbox_owner_directories(self):
         inbox = self.state / "inbox"
         empty_old, empty_new, full = inbox / "empty-old", inbox / "empty-new", inbox / "full"

@@ -177,7 +177,7 @@ start time and argv all match), nothing is dispatched, `notices/stale-tq.json` n
 ### A not-ready checkout waits, then fails
 
 Each pass looks at the integration checkout. If it is dirty, has unrecognised untracked paths, overlaps the
-incoming paths or is on another branch, this no longer stops preparation or validation: the reason is recorded
+incoming paths or is on another branch, preparation and validation are not stopped: the reason is recorded
 at once on the receipt (`checkout_wait_since`, `checkout_wait_reason`) and in `notices/checkout-wait.json`,
 and the work continues. At publication, a not-ready checkout found before Git runs becomes the bounded wait:
 the request is requeued **without penalty** (no attempt or dispatch is consumed) and re-dispatched after about

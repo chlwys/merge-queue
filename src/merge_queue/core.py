@@ -955,7 +955,9 @@ FIXED_LOCKS = {"integration", "submit", "runner"}  # `<name>.lock` files that ar
 def prune_orphans(ctx: Ctx) -> None:
     """Per-request lock files, MCP acceptance intents and empty inbox owner directories that outlived their
     request. Only ids with neither a request nor a tombstone and untouched for a day qualify; a lock that is
-    held is never removed, and the fixed locks are never touched."""
+    held is never removed, and the fixed locks are never touched. An MCP intent whose `queue_request_id` names a
+    known request or tombstone is kept too. The `mcp-<id>.lock` files are transient mutexes (taken only inside
+    `reserve` and `bind`, recreated on demand), so they are pruned by the rule above even when their intent stays."""
     known = {p.stem for name in ("requests", "tombstones") for p in
              (ctx.p(name).glob("*.json") if ctx.p(name).is_dir() else [])}
     cutoff = time.time() - 86400
@@ -985,7 +987,13 @@ def prune_orphans(ctx: Ctx) -> None:
                 probe.release()
     intents = ctx.p("mcp-receipts")
     for path in intents.glob("*.json") if intents.is_dir() else []:
-        if path.stem not in known and stale(path):
+        if path.stem in known or not stale(path):
+            continue
+        try:  # an intent bound to a known canonical receipt (exact-SHA dedup) must keep resolving to it
+            bound = read_json(path).get("queue_request_id")
+        except (OSError, ValueError, AttributeError):  # unreadable or malformed: no receipt to protect
+            bound = None
+        if not isinstance(bound, str) or bound not in known:
             path.unlink(missing_ok=True)
     inbox = ctx.p("inbox")
     for directory in inbox.iterdir() if inbox.is_dir() else []:
@@ -1064,23 +1072,24 @@ def classify_fast_path(ctx: Ctx, rid: str, target: str, candidate: str,
     try:
         policy = load_policy(ctx.policy)
         paths = changed_paths(ctx, target, candidate)
-        if paths:
-            selected, unknown = plan_checks(policy, paths)
-            if not selected and not unknown:  # nothing to validate: no planner and no `fast_path` section needed
-                decision.update(eligible=True, checks=[], reason="no validation check is selected for the changed paths")
-                return decision
         fast = policy.get("fast_path")
-        if fast is None:
-            return decision
-        subst = {"target": target, "candidate": candidate, "checkout": str(ctx.checkout)}
-        argv = policy_argv(fast["plan"], subst, ctx.checkout)
-        code = run_group(argv, ctx.checkout, clean_env(), log, fast.get("timeout", 30), attempt_file)
-        if code != 0:
-            raise ValueError(f"planner exited {code}")
-        planned = last_json_line(log)
-        if type(planned.get("eligible")) is not bool or not isinstance(planned.get("reason"), str):
-            raise ValueError("planner requires boolean eligible and string reason")
-        decision.update(planned, target=target, candidate=candidate, checks=list(fast["checks"]))
+        if fast is not None:  # the operator's planner decides first, so a focused fast-path check is never dropped
+            try:
+                subst = {"target": target, "candidate": candidate, "checkout": str(ctx.checkout)}
+                argv = policy_argv(fast["plan"], subst, ctx.checkout)
+                code = run_group(argv, ctx.checkout, clean_env(), log, fast.get("timeout", 30), attempt_file)
+                if code != 0:
+                    raise ValueError(f"planner exited {code}")
+                planned = last_json_line(log)
+                if type(planned.get("eligible")) is not bool or not isinstance(planned.get("reason"), str):
+                    raise ValueError("planner requires boolean eligible and string reason")
+                decision.update(planned, target=target, candidate=candidate, checks=list(fast["checks"]))
+            except (Fail, OSError, ValueError, IndexError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+                decision.update(eligible=False, reason=f"fast planner unavailable; normal queue: {exc}")
+        if not decision["eligible"] and paths:  # no planner, or it declined: a change that needs no check lands inline
+            selected, unknown = plan_checks(policy, paths)
+            if not selected and not unknown:
+                decision.update(eligible=True, checks=[], reason="no validation check is selected for the changed paths")
     except (Fail, OSError, ValueError, IndexError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         decision.update(eligible=False, reason=f"fast planner unavailable; normal queue: {exc}")
     finally:
@@ -1901,17 +1910,24 @@ def integrate(ctx: Ctx, rid: str, attempt: str, attempts: int, state: dict, inte
             # Publish under the lock we already hold (publish() still does its own fresh checkout/target checks).
             record = validated_record(req)
             mode = req["candidate"]["mode"]
-            mutate(ctx, rid, lambda r: (r.update(phase="validating", target_sha=target), r.setdefault("plan", {}).update(
-                results_reused=True, reused_checks=list(record["checks"]),
-                reused_from={"target": record["target"], "candidate": record["candidate"]})))
-            event(ctx, "validation_reused", rid, mode="exact", checks=record["checks"], target=target,
-                  candidate=record["candidate"])
+            reuse = {"results_reused": True, "reused_checks": list(record["checks"]),
+                     "reused_from": {"target": record["target"], "candidate": record["candidate"]}}
+
+            def mark_reused(r):
+                r.update(phase="validating", target_sha=target)
+                plan = r.setdefault("plan", {})
+                if any(plan.get(key) != value for key, value in reuse.items()):  # a re-dispatch repeats the same reuse
+                    plan.update(reuse)
+            mutate(ctx, rid, mark_reused)
             try:
                 publish(ctx, req, attempt, target, record["candidate"], attempts, integration)
             except TargetMoved:
                 event(ctx, "target_moved", rid, expected=target)
                 integration.release()
                 continue
+            # Recorded once, after publication: a request waiting for the checkout re-enters this branch each cycle.
+            event(ctx, "validation_reused", rid, mode="exact", checks=record["checks"], target=target,
+                  candidate=record["candidate"])
             return finish_landed(ctx, rid, record["candidate"], mode)
         # Long prepare/validation work is private to this request. Only the final readiness checks and
         # publication need the shared lock, so an inline change can pass a slow FIFO validator.

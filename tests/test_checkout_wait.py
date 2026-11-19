@@ -68,6 +68,9 @@ class CheckoutWaitsAfterValidation(unittest.TestCase):
         self.assertEqual(self.runs(), 1)
         self.assertEqual((done["attempts"], done["dispatches"]), (1, 1))
         self.assertTrue(done["plan"]["results_reused"])
+        lines = (fx.state / "diagnostics" / "events.jsonl").read_text().splitlines()  # written at the default level
+        reused = [json.loads(l) for l in lines if '"validation_reused"' in l]
+        self.assertEqual([(e["request_id"], e["mode"]) for e in reused], [("req-x", "exact")])  # once, not per wait
         self.assertNotIn("checkout_wait_since", done)
         self.assertNotIn("checkout_wait_reason", done)
         self.assertFalse(self.notice.exists())  # cleared when the request landed, not on a later runner tick
